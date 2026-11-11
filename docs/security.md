@@ -13,6 +13,7 @@ The setup is meant for a **home network behind a router**. Please don't expose t
 | 8888 web search | the server itself | bound to 127.0.0.1 |
 | 22 SSH | home network | your SSH login |
 | 50052 on GPU PCs | the AI server's IP only | firewall rule on each PC |
+| 50053 on GPU PCs | the AI server's IP only | firewall rule + the report itself refuses other addresses; it only shares GPU-use % and the busiest program's name |
 
 Everything else is blocked by `ufw` (`deny incoming`).
 
