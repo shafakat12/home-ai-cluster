@@ -1,33 +1,22 @@
 # Home AI Cluster
 
-**Run your own private ChatGPT-style AI at home, and combine the graphics cards of several PCs so bigger models fit.**
+My home AI setup, cleaned up so other people can install it on their own network.
 
-One Ubuntu server becomes the "brain" of your home AI. Any other PC with a graphics card (Windows or Linux) can lend its GPU over the network with a one-click installer. Everyone at home chats in the browser on phones, tablets and PCs, each with their own account. An admin web page shows models, GPUs and the health of everything live.
+I have a small Ubuntu server with a 6 GB GTX 1660 Super and a gaming PC with an 11 GB RTX 2080 Ti. Neither card can run a 20B model on its own, but together they can. So this project splits one model across the GPUs of several PCs over the home network (llama.cpp RPC), and puts a normal chat website in front of it so my family can use it from their phones and laptops.
 
-Everything runs on your own hardware. No cloud, no subscription, and your chats never leave your home.
+Everything runs on your own hardware: no cloud, no subscription, and the chats stay at home.
 
-> **Status: beta.** This setup grew out of a real home installation and runs there every day.
-> The installer was then made generic for other networks and hardware. Please report what works and what doesn't on yours (Issues welcome).
+> **Status: beta.** It runs on my own server. A clean install on a fresh machine, AMD/Intel GPUs and RAID creation on real drives are not tested yet. If something breaks on your hardware, please open an issue.
 
----
+## What it does
 
-## What you get
-
-| | |
-|---|---|
-| 💬 **Chat website for the family** | [Open WebUI](https://github.com/open-webui/open-webui) at `http://SERVER:3000`. Each person has a private account. Works on phones too (add it to the home screen). |
-| 🧩 **GPU pooling across PCs** | Big models are split across the server's GPU **and** the GPUs of other PCs ([llama.cpp RPC](https://github.com/ggml-org/llama.cpp)). Example: a 6 GB + 11 GB card together run gpt-oss 20B at about 57–71 tokens/s (measured). |
-| ➕ **Add a PC in one click** | Windows: download one `.bat` from the server and double-click. Linux: one command. New GPUs are found automatically. |
-| 🎛️ **Choose which GPU is used** | Every GPU can be set to **Use**, **Standby** (only for big models) or **Off** (e.g. while you game on that PC). |
-| 🔀 **Many models, one address** | [llama-swap](https://github.com/mostlygeek/llama-swap) loads the right model on demand and unloads the others. |
-| 🤝 **"team" and "auto" models** | *team*: two models answer, a third combines the best answer. *auto*: picks the right model per message (pictures → vision model, code → coding model, quick chat → small fast model). |
-| 📥 **Add models from the web** | Search Hugging Face in the control panel, see if a model fits your GPUs, click **Add**. A weekly check suggests newer models that fit. |
-| 🔎 **Private web search** | A [SearXNG](https://github.com/searxng/searxng) search engine on the server lets the AI look things up without accounts or tracking. |
-| 🖼️ **Image generation** (optional) | [ComfyUI](https://github.com/comfyanonymous/ComfyUI) with Z-Image Turbo on a PC with an NVIDIA GPU, used straight from the chat. |
-| 🩺 **Live health page** | CPU, RAM, GPU temperatures and memory, network, disk space, RAID state, every service, and drive **SMART** health, refreshed every 0.5 s. |
-| 💽 **Your choice of drives** | Keep models on the system disk, in any folder, on a whole spare drive, or on several drives combined as **RAID 0 / 1 / 5 / 10**. Set up during install or later in the control panel's **Storage** tab. Downloaded models move automatically. |
-| 🔔 **Alerts + backups** | Optional Telegram messages when a disk shows problems, a RAID loses a drive, or a service stops. Nightly backup of chats and settings (7 days kept). |
-| 💻 **Coding assistants** | The server speaks the OpenAI **and** Anthropic API: use it from VS Code (Cline, Continue), Claude Code, scripts, and browser AI extensions. |
+- **Family chat:** [Open WebUI](https://github.com/open-webui/open-webui) on port 3000, one account per person, works on phones.
+- **GPU pooling:** big models are split across the server's GPU and the GPUs of other PCs ([llama.cpp](https://github.com/ggml-org/llama.cpp) RPC). Adding a PC is one `.bat` file on Windows or one command on Linux.
+- **GPU control:** each GPU can be set to Use, Standby (only big models) or Off, for example while someone is gaming on that PC.
+- **Models on demand:** [llama-swap](https://github.com/mostlygeek/llama-swap) loads a model when someone asks for it and unloads it later. Two extra models: `auto` picks a model for each message, `team` lets two models answer and a third combine them.
+- **Control panel (port 8091):** add models from Hugging Face, live server and drive health, drives and RAID for storage, adding PCs, Telegram alerts.
+- **Extras:** private web search with [SearXNG](https://github.com/searxng/searxng), optional image generation with [ComfyUI](https://github.com/comfyanonymous/ComfyUI), and an OpenAI/Anthropic-compatible API for VS Code and scripts.
+- **Backups and alerts:** nightly backup of chats and settings, and a Telegram message if a disk, a RAID or a service has a problem.
 
 ## How it works
 
@@ -90,7 +79,7 @@ Then:
 3. *(Optional)* Add GPU PCs: on a Windows PC open `http://SERVER-IP:8090/add-this-pc.bat`, save it, double-click it and click **Yes**. On Linux run `curl -fsSL http://SERVER-IP:8090/add-worker-linux.sh | bash`.
 4. *(Optional)* Add family members in Open WebUI: **Admin Panel → Users → ➕**. Then make the models public for them: **Admin Panel → Settings → Models → ✏️ → Access → Public**.
 
-> 💡 **Reserve the server's IP address in your router** (DHCP reservation / static lease). If the address changes, the GPU PCs and bookmarks stop finding it.
+> **Tip:** reserve the server's IP address in your router (DHCP reservation or static lease). If the address changes, the GPU PCs and bookmarks stop finding it.
 
 ## Using it
 
@@ -129,6 +118,14 @@ Your speed depends on your GPUs and network. Measure it on the server (the secon
 for i in 1 2; do curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"gpt-oss-20b","messages":[{"role":"user","content":"Write about 300 words about rivers."}],"max_tokens":400}' | jq '.timings.predicted_per_second'; done
 ```
 
+## Known issues and what's next
+
+- Only tested on my own hardware (GTX 1660 Super server + RTX 2080 Ti Windows PC, wired 2.5 GbE). AMD and Intel GPUs (Vulkan) should work but I haven't tried them.
+- A full install on a fresh Ubuntu machine hasn't been tested end to end yet.
+- Creating a RAID has only been tested as a dry run, not on real drives.
+- `team` is slow (about 2.5 minutes per answer) because three models run one after another.
+- Pooling needs a wired network. Over Wi-Fi it gets much slower.
+
 ## Documentation
 
 * [How it works](docs/how-it-works.md): the parts, the ports, where files live
@@ -138,7 +135,7 @@ for i in 1 2; do curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-T
 * [Image generation](docs/image-generation.md): ComfyUI on a GPU PC, connecting Open WebUI
 * [Family & other devices](docs/family-and-devices.md): accounts, model access, phones, VS Code
 * [Security](docs/security.md): what is exposed, firewall, passwords, what not to do
-* [Troubleshooting](docs/troubleshooting.md): the problems we hit and how to fix them
+* [Troubleshooting](docs/troubleshooting.md): problems I ran into and how to fix them
 
 ## Settings (`config.env`)
 
