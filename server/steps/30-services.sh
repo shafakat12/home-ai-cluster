@@ -49,7 +49,8 @@ WantedBy=multi-user.target
 EOF
 
 info "worker kit (port 8090: installers for GPU PCs, with this server's address filled in)..."
-for f in "$REPO/worker/windows/add-this-pc.bat" "$REPO/worker/windows/add-worker-windows.ps1" "$REPO/worker/linux/add-worker-linux.sh"; do
+for f in "$REPO/worker/windows/add-this-pc.bat" "$REPO/worker/windows/add-worker-windows.ps1" "$REPO/worker/linux/add-worker-linux.sh" \
+         "$REPO/worker/windows/gpu-status.ps1" "$REPO/worker/linux/gpu-status.py"; do
   sed "s/__SERVER_IP__/$SERVER_IP/g" "$f" > "/opt/ai/worker-kit/$(basename "$f")"
 done
 sed -i 's/\r$//; s/$/\r/' /opt/ai/worker-kit/add-this-pc.bat

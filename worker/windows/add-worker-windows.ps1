@@ -90,9 +90,25 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Pr
 Start-ScheduledTask -TaskName $TaskName
 Start-Sleep 6
 
+# --- GPU use report for the server's auto-off (port 50053, only the AI server may ask) ---
+$StatusTask = "AI GPU Status"; $StatusRule = "AI GPU Status (use report for the AI server)"; $StatusPort = 50053
+$status = Join-Path $InstallDir "gpu-status.ps1"
+if (Get-ScheduledTask -TaskName $StatusTask -ErrorAction SilentlyContinue) { Stop-ScheduledTask -TaskName $StatusTask -ErrorAction SilentlyContinue }
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match '[\\"]gpu-status\.ps1' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Invoke-WebRequest "http://${Server}:8090/gpu-status.ps1" -OutFile $status -UseBasicParsing
+Get-NetFirewallRule -DisplayName $StatusRule -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+New-NetFirewallRule -DisplayName $StatusRule -Direction Inbound -Action Allow -Protocol TCP -LocalPort $StatusPort -RemoteAddress $Server -Profile Any | Out-Null
+$sAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$status`" -Server $Server -Port $StatusPort"
+Register-ScheduledTask -TaskName $StatusTask -Action $sAction -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+Start-ScheduledTask -TaskName $StatusTask
+Write-Output "== GPU use report on port $StatusPort (only $Server may ask) - lets the server switch this GPU off while you use it"
+
 $ok = Test-NetConnection -ComputerName 127.0.0.1 -Port $Port -InformationLevel Quiet -WarningAction SilentlyContinue
 Write-Output "== Worker listening on port ${Port}: $ok"
 if (Test-Path $log) { Write-Output "== Worker log:"; Get-Content $log -Tail 20 }
 $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.PrefixOrigin -in 'Dhcp','Manual' -and $_.IPAddress -notlike '169.*' } | Select-Object -First 1).IPAddress
 Write-Output "== This PC's IP: $ip"
+try { $r = Invoke-RestMethod "http://127.0.0.1:$StatusPort/" -TimeoutSec 10; Write-Output "== GPU use report works: this PC's own programs use $($r.pc_pct)% of the GPU" }
+catch { Write-Output "== GPU use report did not answer yet (auto-off will not work for this PC until it does)" }
 if ($ok) { Write-Output "WORKER-OK" } else { Write-Output "WORKER-FAILED" }

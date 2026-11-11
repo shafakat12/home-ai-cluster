@@ -59,15 +59,40 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now ai-gpu-worker
 sudo systemctl restart ai-gpu-worker
 
-echo "== Firewall: only the AI server may connect to port $PORT"
+echo "== GPU use report (port 50053, only the AI server may ask) - lets the server switch this GPU off while you use it"
+sudo curl -fsSL -o "$DIR/gpu-status.py" "http://$SERVER:8090/gpu-status.py"
+sudo chmod 755 "$DIR/gpu-status.py"
+sudo tee /etc/systemd/system/ai-gpu-status.service >/dev/null <<UNIT
+[Unit]
+Description=AI GPU use report for the AI server's auto-off
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+DynamicUser=yes
+SupplementaryGroups=video render
+ExecStart=/usr/bin/python3 $DIR/gpu-status.py $SERVER 50053
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo systemctl daemon-reload
+sudo systemctl enable --now ai-gpu-status >/dev/null 2>&1
+sudo systemctl restart ai-gpu-status
+
+echo "== Firewall: only the AI server may connect to ports $PORT and 50053"
 if sudo ufw status | grep -q "Status: active"; then
   sudo ufw allow from "$SERVER" to any port "$PORT" proto tcp comment 'AI GPU worker'
+  sudo ufw allow from "$SERVER" to any port 50053 proto tcp comment 'AI GPU use report'
 else
   # ufw was off: turn it on (blocks all incoming except SSH and the AI server). Outgoing traffic is unaffected.
   sudo ufw default deny incoming >/dev/null
   sudo ufw default allow outgoing >/dev/null
   sudo ufw allow OpenSSH >/dev/null 2>&1 || true
   sudo ufw allow from "$SERVER" to any port "$PORT" proto tcp comment 'AI GPU worker'
+  sudo ufw allow from "$SERVER" to any port 50053 proto tcp comment 'AI GPU use report'
   sudo ufw --force enable
   echo "   Firewall (ufw) was off and is now ON: incoming blocked except SSH and the AI server."
 fi
