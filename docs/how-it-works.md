@@ -1,11 +1,14 @@
 # How it works
 
+This page is about what runs where. For what each tab and button of the control panel does, see [The control panel, tab by tab](control-panel.md).
+
 ## The parts
 
 | Part | Runs on | Port | What it does |
 |---|---|---|---|
 | **llama.cpp** (`llama-server`) | server | 10001+ (internal) | runs one AI model, split across the allowed GPUs |
 | **rpc-server** | each GPU PC | 50052 | lends that PC's GPU to the server (only the server may connect) |
+| **GPU-use report** | each GPU PC | 50053 | tells the server how much the PC's own programs use its GPU, for auto-off (only the server may ask) |
 | **llama-swap** | server | 8080 | one API address for all models; starts the model a request asks for, stops idle ones |
 | **router.py** | server (started by llama-swap) | internal | the virtual models `team` and `auto` |
 | **Open WebUI** | server (Docker) | 3000 | the chat website, user accounts, image generation, web search, documents |
@@ -38,6 +41,8 @@ Groups in `llama-swap.yaml` decide which models may run at the same time. Small 
 * **Use**: every model may use this GPU.
 * **Standby**: only big pooled models use it, or models with nowhere else to go.
 * **Off**: never used. Good for a gaming PC while someone is playing.
+* **Auto-off**: the control panel checks every GPU PC every 5 seconds. Above 40% use by the PC's own programs it sets that GPU to Off and stops the models using it; 5 minutes after the PC is quiet it restores the old mode. State: `/opt/ai/gpu-guard.json`, settings in `/opt/ai/gpu-policy.json` (`auto_off_pct`, `auto_back_min`).
+* **In use by a model**: a GPU PC serves one model at a time and doesn't answer other connections meanwhile. The panel sees which GPU PCs the running models use and shows them as in use instead of offline.
 
 ## Files on the server
 

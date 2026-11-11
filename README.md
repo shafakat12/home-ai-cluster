@@ -12,11 +12,38 @@ Everything runs on your own hardware: no cloud, no subscription, and the chats s
 
 - **Family chat:** [Open WebUI](https://github.com/open-webui/open-webui) on port 3000, one account per person, works on phones.
 - **GPU pooling:** big models are split across the server's GPU and the GPUs of other PCs ([llama.cpp](https://github.com/ggml-org/llama.cpp) RPC). Adding a PC is one `.bat` file on Windows or one command on Linux.
-- **GPU control:** each GPU can be set to Use, Standby (only big models) or Off, for example while someone is gaming on that PC.
+- **GPU control:** each GPU can be set to Use, Standby (only big models) or Off. **Auto-off:** when a GPU PC's own programs (a game, a video...) use more than 40% of its GPU, the server stops using that GPU, and takes it back 5 minutes after the PC is quiet again. A GPU PC that is busy with a model shows as "in use".
 - **Models on demand:** [llama-swap](https://github.com/mostlygeek/llama-swap) loads a model when someone asks for it and unloads it later. Two extra models: `auto` picks a model for each message, `team` lets two models answer and a third combine them.
 - **Control panel (port 8091):** add models from Hugging Face, live server and drive health, drives and RAID for storage, adding PCs, Telegram alerts.
 - **Extras:** private web search with [SearXNG](https://github.com/searxng/searxng), optional image generation with [ComfyUI](https://github.com/comfyanonymous/ComfyUI), and an OpenAI/Anthropic-compatible API for VS Code and scripts.
 - **Backups and alerts:** nightly backup of chats and settings, and a Telegram message if a disk, a RAID or a service has a problem.
+
+## Start here: what each tab does
+
+After installing, you'll mostly use two web pages: the chat at `http://SERVER-IP:3000` (for everyone) and the control panel at `http://SERVER-IP:8091` (for you, the admin). The control panel has six tabs:
+
+| Tab | What it's for |
+|---|---|
+| **Models** | weekly suggestions that fit your GPUs, search Hugging Face, download, rename and remove models |
+| **GPUs** | set each graphics card to Use, Standby or Off, auto-off while a PC is busy, Forget an old PC, stop running models |
+| **Health** | live CPU, memory, GPU, temperatures, network, services and drive health (SMART) |
+| **Storage** | move models and backups to another drive, a folder or a RAID |
+| **Add a PC** | the installer link for a Windows PC and the command for a Linux PC, and the GPU PCs the server can see |
+| **Settings** | Telegram alerts, which devices may use the API, admin password and logged-in devices |
+
+Every button and status is explained in [The control panel, tab by tab](docs/control-panel.md).
+
+## Screenshots
+
+The control panel from this repository, showing real values from my server (serial numbers hidden).
+
+![GPUs tab: the server's GTX 1660 Super and the RTX 2080 Ti in my Windows PC, each set to Use, Standby or Off, with the auto-off settings and the PC's own GPU use](docs/images/control-panel-gpus.png)
+
+![Health tab: live CPU, memory, GPU, temperatures, network, storage and services](docs/images/control-panel-health.png)
+
+![Drive health: SMART data of my 1 TB HDD, which shows a warning for 6 uncorrectable errors](docs/images/control-panel-drive-health.png)
+
+![Models tab: weekly suggestions that fit my GPUs, and the installed models](docs/images/control-panel-models.png)
 
 ## How it works
 
@@ -79,7 +106,7 @@ Then:
 3. *(Optional)* Add GPU PCs: on a Windows PC open `http://SERVER-IP:8090/add-this-pc.bat`, save it, double-click it and click **Yes**. On Linux run `curl -fsSL http://SERVER-IP:8090/add-worker-linux.sh | bash`.
 4. *(Optional)* Add family members in Open WebUI: **Admin Panel → Users → ➕**. Then make the models public for them: **Admin Panel → Settings → Models → ✏️ → Access → Public**.
 
-> **Tip:** reserve the server's IP address in your router (DHCP reservation or static lease). If the address changes, the GPU PCs and bookmarks stop finding it.
+> **Tip:** reserve the IP addresses of the server **and the GPU PCs** in your router (DHCP reservation or static lease). If the server's address changes, the GPU PCs and bookmarks stop finding it; if a GPU PC's address changes, it shows up as a new GPU. See [IP addresses](docs/ip-addresses.md) for what happens and how to fix it.
 
 ## Using it
 
@@ -125,11 +152,15 @@ for i in 1 2; do curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-T
 - Creating a RAID has only been tested as a dry run, not on real drives.
 - `team` is slow (about 2.5 minutes per answer) because three models run one after another.
 - Pooling needs a wired network. Over Wi-Fi it gets much slower.
+- Auto-off on Linux GPU PCs needs an NVIDIA GPU (it reads `nvidia-smi`). On Windows it works with any GPU.
+- GPU PCs are remembered by IP address. A PC that gets a new address shows up as a new GPU (name and mode reset), and its old entry can be removed with **Forget**. Reserve the addresses: see [IP addresses](docs/ip-addresses.md).
 
 ## Documentation
 
+* [The control panel, tab by tab](docs/control-panel.md): what every tab, button and status means
 * [How it works](docs/how-it-works.md): the parts, the ports, where files live
 * [Adding GPU PCs](docs/adding-gpu-pcs.md): Windows and Linux, Use / Standby / Off, removing a PC
+* [IP addresses](docs/ip-addresses.md): why to reserve them, and what happens when the server's or a GPU PC's address changes
 * [Storage](docs/storage.md): which drive or folder, RAID 0/1/5/10, replacing a failed drive
 * [Models](docs/models.md): presets, adding models, solo / pool / remote, team & auto
 * [Image generation](docs/image-generation.md): ComfyUI on a GPU PC, connecting Open WebUI
