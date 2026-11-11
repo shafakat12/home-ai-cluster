@@ -15,19 +15,19 @@ Everything runs on your own hardware. No cloud, no subscription, and your chats 
 
 | | |
 |---|---|
-| ðŸ’¬ **Chat website for the family** | [Open WebUI](https://github.com/open-webui/open-webui) at `http://SERVER:3000`. Each person has a private account. Works on phones too (add it to the home screen). |
-| ðŸ§© **GPU pooling across PCs** | Big models are split across the server's GPU **and** the GPUs of other PCs ([llama.cpp RPC](https://github.com/ggml-org/llama.cpp)). Example: a 6 GB + 11 GB card together run gpt-oss 20B at about 57â€“71 tokens/s (measured). |
-| âž• **Add a PC in one click** | Windows: download one `.bat` from the server and double-click. Linux: one command. New GPUs are found automatically. |
-| ðŸŽ›ï¸ **Choose which GPU is used** | Every GPU can be set to **Use**, **Standby** (only for big models) or **Off** (e.g. while you game on that PC). |
-| ðŸ”€ **Many models, one address** | [llama-swap](https://github.com/mostlygeek/llama-swap) loads the right model on demand and unloads the others. |
-| ðŸ¤ **"team" and "auto" models** | *team*: two models answer, a third combines the best answer. *auto*: picks the right model per message (pictures â†’ vision model, code â†’ coding model, quick chat â†’ small fast model). |
-| ðŸ“¥ **Add models from the web** | Search Hugging Face in the control panel, see if a model fits your GPUs, click **Add**. A weekly check suggests newer models that fit. |
-| ðŸ”Ž **Private web search** | A [SearXNG](https://github.com/searxng/searxng) search engine on the server lets the AI look things up without accounts or tracking. |
-| ðŸ–¼ï¸ **Image generation** (optional) | [ComfyUI](https://github.com/comfyanonymous/ComfyUI) with Z-Image Turbo on a PC with an NVIDIA GPU, used straight from the chat. |
-| ðŸ©º **Live health page** | CPU, RAM, GPU temperatures and memory, network, disk space, RAID state, every service, and drive **SMART** health, refreshed every 0.5 s. |
-| ðŸ’½ **Your choice of drives** | Keep models on the system disk, in any folder, on a whole spare drive, or on several drives combined as **RAID 0 / 1 / 5 / 10**. Set up during install or later in the control panel's **Storage** tab. Downloaded models move automatically. |
-| ðŸ”” **Alerts + backups** | Optional Telegram messages when a disk shows problems, a RAID loses a drive, or a service stops. Nightly backup of chats and settings (7 days kept). |
-| ðŸ’» **Coding assistants** | The server speaks the OpenAI **and** Anthropic API: use it from VS Code (Cline, Continue), Claude Code, scripts, and browser AI extensions. |
+| 💬 **Chat website for the family** | [Open WebUI](https://github.com/open-webui/open-webui) at `http://SERVER:3000`. Each person has a private account. Works on phones too (add it to the home screen). |
+| 🧩 **GPU pooling across PCs** | Big models are split across the server's GPU **and** the GPUs of other PCs ([llama.cpp RPC](https://github.com/ggml-org/llama.cpp)). Example: a 6 GB + 11 GB card together run gpt-oss 20B at about 57–71 tokens/s (measured). |
+| ➕ **Add a PC in one click** | Windows: download one `.bat` from the server and double-click. Linux: one command. New GPUs are found automatically. |
+| 🎛️ **Choose which GPU is used** | Every GPU can be set to **Use**, **Standby** (only for big models) or **Off** (e.g. while you game on that PC). |
+| 🔀 **Many models, one address** | [llama-swap](https://github.com/mostlygeek/llama-swap) loads the right model on demand and unloads the others. |
+| 🤝 **"team" and "auto" models** | *team*: two models answer, a third combines the best answer. *auto*: picks the right model per message (pictures → vision model, code → coding model, quick chat → small fast model). |
+| 📥 **Add models from the web** | Search Hugging Face in the control panel, see if a model fits your GPUs, click **Add**. A weekly check suggests newer models that fit. |
+| 🔎 **Private web search** | A [SearXNG](https://github.com/searxng/searxng) search engine on the server lets the AI look things up without accounts or tracking. |
+| 🖼️ **Image generation** (optional) | [ComfyUI](https://github.com/comfyanonymous/ComfyUI) with Z-Image Turbo on a PC with an NVIDIA GPU, used straight from the chat. |
+| 🩺 **Live health page** | CPU, RAM, GPU temperatures and memory, network, disk space, RAID state, every service, and drive **SMART** health, refreshed every 0.5 s. |
+| 💽 **Your choice of drives** | Keep models on the system disk, in any folder, on a whole spare drive, or on several drives combined as **RAID 0 / 1 / 5 / 10**. Set up during install or later in the control panel's **Storage** tab. Downloaded models move automatically. |
+| 🔔 **Alerts + backups** | Optional Telegram messages when a disk shows problems, a RAID loses a drive, or a service stops. Nightly backup of chats and settings (7 days kept). |
+| 💻 **Coding assistants** | The server speaks the OpenAI **and** Anthropic API: use it from VS Code (Cline, Continue), Claude Code, scripts, and browser AI extensions. |
 
 ## How it works
 
@@ -80,7 +80,7 @@ sudo bash install.sh
 
 * The installer asks **where to store the models** if the server has more than one drive: the system disk, a folder, a whole drive, or a RAID. See [Storage](docs/storage.md). Change it later in the control panel (**Storage** tab) or with `sudo ai-storage`.
 * If the server has an NVIDIA GPU without a driver, the installer installs one and asks you to **reboot**. Run `sudo bash install.sh` again afterwards; it continues where it stopped.
-* The starter models (3â€“24 GB, chosen to fit your GPU) download in the background. Follow along with `tail -f /opt/ai/logs/model-download.log`.
+* The starter models (3–24 GB, chosen to fit your GPU) download in the background. Follow along with `tail -f /opt/ai/logs/model-download.log`.
 * At the end the installer prints your addresses and a **setup code** for the control panel.
 
 Then:
@@ -88,9 +88,9 @@ Then:
 1. Open **`http://SERVER-IP:3000`** and create the first account. It becomes the chat admin.
 2. Open **`http://SERVER-IP:8091`** and create the control-panel admin password with the setup code.
 3. *(Optional)* Add GPU PCs: on a Windows PC open `http://SERVER-IP:8090/add-this-pc.bat`, save it, double-click it and click **Yes**. On Linux run `curl -fsSL http://SERVER-IP:8090/add-worker-linux.sh | bash`.
-4. *(Optional)* Add family members in Open WebUI: **Admin Panel â†’ Users â†’ âž•**. Then make the models public for them: **Admin Panel â†’ Settings â†’ Models â†’ âœï¸ â†’ Access â†’ Public**.
+4. *(Optional)* Add family members in Open WebUI: **Admin Panel → Users → ➕**. Then make the models public for them: **Admin Panel → Settings → Models → ✏️ → Access → Public**.
 
-> ðŸ’¡ **Reserve the server's IP address in your router** (DHCP reservation / static lease). If the address changes, the GPU PCs and bookmarks stop finding it.
+> 💡 **Reserve the server's IP address in your router** (DHCP reservation / static lease). If the address changes, the GPU PCs and bookmarks stop finding it.
 
 ## Using it
 
@@ -119,7 +119,7 @@ Each test asks for a 400-token answer, after the model has loaded (second run, N
 |---|---|---|
 | `qwen3.5-4b` | server GPU | 63 tokens/s |
 | `gemma-4-12b` (vision) | GPU PC | 42 tokens/s |
-| `gpt-oss-20b` | split over both GPUs | 57â€“71 tokens/s (three runs) |
+| `gpt-oss-20b` | split over both GPUs | 57–71 tokens/s (three runs) |
 | `auto` | picks one model per message | the speed of the model it picks (42 tokens/s in the test) |
 | `team` | two models answer, a third combines | about 2.5 minutes for a full 400-token answer |
 
@@ -183,7 +183,7 @@ CLAUDE.md                   notes for AI coding assistants working on this repos
 
 ## Built with
 
-[llama.cpp](https://github.com/ggml-org/llama.cpp) Â· [llama-swap](https://github.com/mostlygeek/llama-swap) Â· [Open WebUI](https://github.com/open-webui/open-webui) Â· [SearXNG](https://github.com/searxng/searxng) Â· [ComfyUI](https://github.com/comfyanonymous/ComfyUI) Â· [smartmontools](https://www.smartmontools.org/) Â· models from [Hugging Face](https://huggingface.co) (Qwen, gpt-oss, Gemma, Z-Image), each under its own license.
+[llama.cpp](https://github.com/ggml-org/llama.cpp) · [llama-swap](https://github.com/mostlygeek/llama-swap) · [Open WebUI](https://github.com/open-webui/open-webui) · [SearXNG](https://github.com/searxng/searxng) · [ComfyUI](https://github.com/comfyanonymous/ComfyUI) · [smartmontools](https://www.smartmontools.org/) · models from [Hugging Face](https://huggingface.co) (Qwen, gpt-oss, Gemma, Z-Image), each under its own license.
 
 ## License
 

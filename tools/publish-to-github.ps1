@@ -36,7 +36,7 @@ if (-not (git config user.name))  { git config user.name $login }
 git config user.email "$uid+$login@users.noreply.github.com"   # always (this repo only) - hides your real e-mail
 
 # --- fill in the clone address in the README
-$readme = Get-Content README.md -Raw
+$readme = [IO.File]::ReadAllText((Resolve-Path README.md), [Text.Encoding]::UTF8)   # not Get-Content: PowerShell 5.1 reads it as ANSI and breaks emoji
 if ($readme -match "YOUR-USERNAME") {
   [IO.File]::WriteAllText((Resolve-Path README.md), $readme.Replace("YOUR-USERNAME/home-ai-cluster", "$login/$Name"), (New-Object Text.UTF8Encoding $false))
   Write-Output "== README: clone address set to github.com/$login/$Name"
