@@ -2,4 +2,4 @@ config.env
 *.log
 __pycache__/
 *.pyc
-CLAUDE-CODE-TASKS*.md
+CLAUDE-CODE-*.md
