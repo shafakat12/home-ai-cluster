@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Nightly backup of the Home AI settings and chat data (not the big model files). Keeps the last 7 days.
+set -uo pipefail
+B=$(grep -oP '^BACKUP_DIR=\K.*' /opt/ai/ai.conf 2>/dev/null); B=${B:-/opt/ai/backups}
+mkdir -p "$B"; chmod 700 "$B"
+D=$B/$(date +%F); mkdir -p "$D"
+V=$(docker volume inspect open-webui -f '{{.Mountpoint}}' 2>/dev/null)
+if [ -n "$V" ] && [ -f "$V/webui.db" ]; then
+  sqlite3 "$V/webui.db" ".backup '$D/open-webui-webui.db'"
+  tar -C "$V" --exclude=webui.db -czf "$D/open-webui-files.tgz" . 2>/dev/null
+fi
+tar -C /opt/ai -czf "$D/ai-settings.tgz" --ignore-failed-read secrets llama-swap.yaml router.json gpu-policy.json ai.conf \
+    searxng suggestions.json api-allow.txt panel-allow.txt workers.txt 2>/dev/null
+chmod -R go-rwx "$D"
+ls -1d "$B"/20* 2>/dev/null | head -n -7 | xargs -r rm -rf
+echo "backup $(du -sh "$D" | cut -f1) -> $D"

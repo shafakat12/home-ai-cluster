@@ -1,0 +1,193 @@
+#!/usr/bin/python3 -I
+"""Root helper for the Home AI control panel: reads SMART health of the server's disks (smartctl) and RAID state.
+  disk-health json          all disks as JSON (health, temperature, hours, key attributes, usage)
+  disk-health test <sdX>    start a short self-test (about 2 minutes) on one disk
+  disk-health check         disks + RAID + key services: alert (Telegram + alerts list) on NEW problems
+Nothing here changes data on the disks."""
+import json, os, re, subprocess, sys, time
+
+STATE = "/var/lib/home-ai/health-state.json"
+ALERTS = "/var/lib/home-ai/alerts.log"
+TG = "/opt/ai/secrets/telegram.env"
+KEY_ATTRS = {5: "Reallocated sectors", 187: "Uncorrectable errors", 188: "Command timeouts", 197: "Pending sectors",
+             198: "Offline uncorrectable", 199: "Cable (CRC) errors", 9: "Power-on hours", 12: "Power cycles",
+             194: "Temperature", 190: "Airflow temperature", 177: "Wear leveling", 233: "Media wearout",
+             231: "SSD life left", 202: "Percent lifetime remain", 241: "Total written", 242: "Total read"}
+BAD_IF_ABOVE_ZERO = {5, 187, 197, 198}
+
+
+def run(args, timeout=60):
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+
+
+def disks():
+    out = json.loads(run(["lsblk", "-J", "-d", "-o", "NAME,TYPE,SIZE,ROTA,TRAN,MODEL,SERIAL"]).stdout)
+    return [d for d in out["blockdevices"] if d["type"] == "disk" and not d["name"].startswith(("loop", "zram", "sr"))]
+
+
+def usage(name):
+    out = json.loads(run(["lsblk", "-J", "-o", "NAME,MOUNTPOINTS", f"/dev/{name}"]).stdout)
+    mps = []
+
+    def walk(n):
+        mps.extend([m for m in (n.get("mountpoints") or []) if m and not m.startswith("/boot") and m != "[SWAP]"])
+        for c in n.get("children", []): walk(c)
+    for n in out["blockdevices"]: walk(n)
+    res = []
+    for m in mps:
+        st = os.statvfs(m)
+        total, free = st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
+        res.append({"mount": m, "total_gb": round(total / 1e9, 1), "used_gb": round((total - free) / 1e9, 1),
+                    "pct": round(100 * (total - free) / total) if total else 0})
+    return res
+
+
+def one(d):
+    name = d["name"]
+    r = {"name": name, "model": d.get("model") or "", "serial": d.get("serial") or "", "size": d.get("size"),
+         "kind": "HDD" if d.get("rota") else ("NVMe SSD" if name.startswith("nvme") else "SSD"), "usage": usage(name)}
+    p = run(["smartctl", "-a", "-j", f"/dev/{name}"])
+    try: j = json.loads(p.stdout)
+    except Exception:
+        r.update(health="unknown", problems=["SMART could not be read"]); return r
+    st = j.get("smart_status", {})
+    r["smart_ok"] = st.get("passed")
+    r["temp"] = (j.get("temperature") or {}).get("current")
+    r["hours"] = (j.get("power_on_time") or {}).get("hours")
+    r["cycles"] = j.get("power_cycle_count")
+    r["rpm"] = j.get("rotation_rate")
+    attrs, problems = [], []
+    for a in (j.get("ata_smart_attributes") or {}).get("table", []):
+        raw = (a.get("raw") or {}).get("value", 0)
+        row = {"id": a["id"], "name": a.get("name", ""), "label": KEY_ATTRS.get(a["id"], ""), "value": a.get("value"),
+               "worst": a.get("worst"), "thresh": a.get("thresh"), "raw": raw, "raw_str": (a.get("raw") or {}).get("string", ""),
+               "failing": bool(a.get("when_failed"))}
+        attrs.append(row)
+        if a["id"] in BAD_IF_ABOVE_ZERO and raw > 0: problems.append(f"{row['label']}: {raw}")
+        if row["failing"]: problems.append(f"{a.get('name')} is below the safe limit")
+        if a["id"] in (177, 233, 231, 202) and a.get("value") is not None and a["value"] < 20:
+            problems.append(f"SSD wear: only {a['value']}% life left")
+    nv = j.get("nvme_smart_health_information_log")
+    if nv:
+        for k, lab in (("percentage_used", "Life used %"), ("media_errors", "Media errors"), ("unsafe_shutdowns", "Unsafe shutdowns"),
+                       ("data_units_written", "Data written (units)"), ("available_spare", "Spare left %")):
+            if k in nv: attrs.append({"id": k, "name": k, "label": lab, "value": nv[k], "raw": nv[k], "raw_str": str(nv[k])})
+        if nv.get("media_errors", 0) > 0: problems.append(f"Media errors: {nv['media_errors']}")
+        if nv.get("percentage_used", 0) >= 90: problems.append(f"SSD worn: {nv['percentage_used']}% used")
+    r["attrs"] = attrs
+    if r["temp"] and r["temp"] >= 55: problems.append(f"Hot: {r['temp']} °C")
+    tests = (j.get("ata_smart_self_test_log") or {}).get("standard", {}).get("table", [])
+    if tests:
+        t = tests[0]; r["last_test"] = {"type": (t.get("type") or {}).get("string", ""), "result": (t.get("status") or {}).get("string", ""),
+                                        "passed": (t.get("status") or {}).get("passed"), "hours": t.get("lifetime_hours")}
+    running = (j.get("ata_smart_data") or {}).get("self_test", {}).get("status", {})
+    if running.get("remaining_percent"): r["test_running"] = f"{100 - running['remaining_percent']}% done"
+    if st.get("passed") is False: problems.insert(0, "SMART overall health: FAILED - copy important data off this disk now")
+    r["problems"] = problems
+    r["health"] = "bad" if st.get("passed") is False else ("warning" if problems else "good")
+    return r
+
+
+def raids(text=None):
+    """RAID arrays from /proc/mdstat: level, state, member drives, failed drives, rebuild progress."""
+    if text is None:
+        try: text = open("/proc/mdstat").read()
+        except Exception: return []
+    labels = {}
+    try:
+        for n in os.listdir("/dev/md"): labels[os.path.basename(os.path.realpath("/dev/md/" + n))] = n
+    except Exception: pass
+    out, cur = [], None
+    for l in text.splitlines():
+        m = re.match(r"^(md\w+) : (\w+)\s*(.*)$", l)
+        if m:
+            parts = m.group(3).split()
+            mem = [(re.match(r"(\w+)\[\d+\]", p), p) for p in parts]
+            cur = {"name": m.group(1), "label": labels.get(m.group(1), ""), "state": m.group(2),
+                   "level": next((p for p in parts if p.startswith("raid") or p == "linear"), ""),
+                   "members": [x.group(1) for x, p in mem if x], "failed": [x.group(1) for x, p in mem if x and p.endswith("(F)")],
+                   "disks": None, "disks_ok": None, "sync": None}
+            out.append(cur); continue
+        if not cur: continue
+        s = re.search(r"\[(\d+)/(\d+)\] \[[U_]+\]", l)
+        if s: cur["disks"], cur["disks_ok"] = int(s.group(1)), int(s.group(2))
+        s = re.search(r"(resync|recovery|reshape|check)\s*=\s*([\d.]+)%.*?finish=([\d.]+)min", l)
+        if s: cur["sync"] = {"what": s.group(1), "pct": float(s.group(2)), "eta_min": round(float(s.group(3)))}
+    for r in out:
+        r["degraded"] = r["state"] != "active" or bool(r["failed"]) or (r["disks"] is not None and r["disks_ok"] < r["disks"])
+        r["problem"] = "" if not r["degraded"] else (
+            f"RAID {r['label'] or r['name']} is not running ({r['state']})" if r["state"] != "active" else
+            f"RAID {r['label'] or r['name']} is degraded - a drive failed or is missing" + (f" ({', '.join(r['failed'])})" if r["failed"] else "")
+            + ". It still works, but replace the drive soon (docs/storage.md)")
+    return out
+
+
+def report():
+    return {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "disks": [one(d) for d in disks()], "raids": raids()}
+
+
+def notify(text):
+    c = {}
+    try:
+        for l in open(TG):
+            if "=" in l: k, v = l.strip().split("=", 1); c[k] = v
+    except FileNotFoundError: return
+    if not (c.get("TOKEN") and c.get("CHAT_ID")): return
+    import urllib.request
+    try:
+        urllib.request.urlopen(urllib.request.Request(f"https://api.telegram.org/bot{c['TOKEN']}/sendMessage",
+            data=json.dumps({"chat_id": c["CHAT_ID"], "text": text}).encode(), headers={"Content-Type": "application/json"}), timeout=15)
+    except Exception: pass
+
+
+def check():
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    try: old = json.load(open(STATE))
+    except Exception: old = {}
+    rep = report(); new = {}
+    for d in rep["disks"]:
+        key = d["serial"] or d["name"]; new[key] = d["problems"]
+        fresh = [p for p in d["problems"] if p not in old.get(key, [])]
+        if fresh:
+            text = f"Disk {d['name']} ({d['model']} {d['size']}): " + "; ".join(fresh)
+            with open(ALERTS, "a") as f:
+                f.write(json.dumps({"time": rep["time"], "kind": "disk", "text": text}) + "\n")
+            notify("💽 " + text)
+    rp = [r["problem"] for r in rep["raids"] if r["problem"]]
+    new["_raid"] = rp
+    for t in rp:
+        if t not in old.get("_raid", []):
+            with open(ALERTS, "a") as f:
+                f.write(json.dumps({"time": rep["time"], "kind": "raid", "text": t}) + "\n")
+            notify("🧱 " + t)
+    if old.get("_raid") and not rp: notify("✅ RAID is healthy again")
+    units = ["llama-swap", "open-webui", "ai-control-panel", "ai-worker-kit", "docker"]
+    act = run(["systemctl", "is-active", *units]).stdout.split()
+    down = [u for i, u in enumerate(units) if i < len(act) and act[i] != "active"]
+    new["_services"] = down
+    for u in down:
+        if u not in old.get("_services", []):
+            text = f"Service '{u}' is not running on the AI server"
+            with open(ALERTS, "a") as f:
+                f.write(json.dumps({"time": rep["time"], "kind": "service", "text": text}) + "\n")
+            notify("⚠️ " + text)
+    for u in old.get("_services", []):
+        if u not in down: notify(f"✅ Service '{u}' is running again")
+    json.dump(new, open(STATE, "w"))
+    print("checked", len(rep["disks"]), "disks;", "services down: " + (", ".join(down) or "none"))
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a[:1] == ["json"]:
+        print(json.dumps(report()))
+    elif a[:1] == ["test"] and len(a) == 2:
+        names = {d["name"] for d in disks()}
+        if a[1] not in names: print("unknown disk"); sys.exit(1)
+        p = run(["smartctl", "-t", "short", f"/dev/{a[1]}"])
+        print("Short self-test started on " + a[1] + " (about 2 minutes). Refresh to see the result." if p.returncode in (0, 4)
+              else (p.stdout + p.stderr)[-300:])
+    elif a[:1] == ["check"]:
+        check()
+    else:
+        print(__doc__)

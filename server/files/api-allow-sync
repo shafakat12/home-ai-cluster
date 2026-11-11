@@ -1,0 +1,38 @@
+#!/usr/bin/python3 -I
+"""Root helper for the AI Control Panel: lets the devices listed in /opt/ai/api-allow.txt use the
+AI API (port 8080) directly. Only home-network IPv4 addresses are accepted. ADMIN_PC_IP stays allowed."""
+import ipaddress, json, os, subprocess
+
+LIST, STATE, PORT = "/opt/ai/api-allow.txt", "/var/lib/home-ai/api-allow.applied", "8080"
+os.makedirs("/var/lib/home-ai", exist_ok=True)
+MAIN_PC = ""
+try:
+    MAIN_PC = open("/opt/ai/panel-allow.txt").read().split()[0]
+except Exception:
+    pass
+
+
+def ufw(*a):
+    return subprocess.run(["ufw", *a], capture_output=True, text=True)
+
+
+want = set()
+try:
+    for l in open(LIST):
+        l = l.strip()
+        if not l or l.startswith("#"): continue
+        try:
+            a = ipaddress.ip_address(l)
+            if a.version == 4 and a.is_private and str(a) != MAIN_PC: want.add(str(a))
+        except ValueError:
+            pass
+except FileNotFoundError:
+    pass
+try: have = set(json.load(open(STATE)))
+except Exception: have = set()
+for ip in sorted(have - want):
+    ufw("delete", "allow", "from", ip, "to", "any", "port", PORT, "proto", "tcp")
+for ip in sorted(want - have):
+    ufw("allow", "from", ip, "to", "any", "port", PORT, "proto", "tcp", "comment", "AI API (control panel)")
+json.dump(sorted(want), open(STATE, "w"))
+print("Direct AI access allowed for: " + (", ".join(([MAIN_PC + " (admin PC)"] if MAIN_PC else []) + sorted(want)) or "nobody yet"))

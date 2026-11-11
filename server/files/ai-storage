@@ -1,0 +1,549 @@
+#!/usr/bin/env bash
+# Home AI Cluster - choose where the AI models (and the nightly backups) are stored.
+#
+#   sudo ai-storage                                menu (easiest)
+#   sudo ai-storage list                           drives, current storage and RAID status
+#   sudo ai-storage folder <path>                  use a folder on a drive that is already set up (erases nothing)
+#   sudo ai-storage drive <disk>                   ERASE one drive, format it and keep the models on it
+#   sudo ai-storage raid <0|1|5|10> <disk> <disk>...
+#                                                  ERASE several drives and combine them into one RAID
+#   sudo ai-storage backups <path>                 move only the nightly backups to another folder
+#   sudo ai-storage apply <spec>                   used by the installer (STORAGE= in config.env)
+#   sudo ai-storage json                           drives + current storage as JSON (for the control panel)
+#   sudo ai-storage job <command> [args]           run folder/backups/drive/raid in the background
+#                                                  (log: /opt/ai/logs/storage-job.log) - used by the control panel
+# Options:  --dry-run      show what would happen, change nothing
+#           --backups      also keep the nightly backups on the new drive / RAID
+#           --no-backups   leave the backups where they are
+#           --yes          do not ask you to type ERASE (for scripts only - be careful)
+#           --accept-warnings  use a Windows-format, network or not-in-fstab drive without asking
+#
+# Disks can be given as /dev/sdb or /dev/disk/by-id/... (by-id names never change).
+# Models already downloaded are moved to the new place (the AI pauses while they move).
+# The system disk, mounted drives and drives already in a RAID/LVM are never touched.
+set -uo pipefail
+export LC_ALL=C
+
+CONF=/opt/ai/ai.conf
+SWAP_YAML=/opt/ai/llama-swap.yaml
+DRY=0; YES=0; BACKUPS=auto; FIRST=0; ACCEPT=0
+LOCK=/run/ai-storage.lock
+JOBLOG=/opt/ai/logs/storage-job.log
+ALLOW_LOOP=${AI_STORAGE_TEST_LOOP:-0}      # automated tests only: treat loop devices as drives
+
+info(){ echo "  $*"; }
+warn(){ echo "!! $*" >&2; }
+die(){ echo "!! $*" >&2; exit 1; }
+run(){ if [ "$DRY" = 1 ]; then echo "  [dry-run] $*"; else "$@"; fi; }
+usage(){ sed -n '2,/^set -uo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0; }
+
+conf_get(){ local v; v=$(grep -oP "^$1=\K.*" "$CONF" 2>/dev/null | tail -1); echo "${v:-${2:-}}"; }
+conf_set(){
+  if [ "$DRY" = 1 ]; then echo "  [dry-run] set $1=$2 in $CONF"; return; fi
+  { grep -v "^$1=" "$CONF" 2>/dev/null || true; echo "$1=$2"; } > "$CONF.tmp" && mv "$CONF.tmp" "$CONF" && chmod 644 "$CONF"
+}
+# ask "question" y|n  -> yes/no; without a terminal the default is used
+ask(){
+  local a d=$2
+  [ -t 0 ] || { [ "$d" = y ]; return; }
+  read -r -p "  $1 [$([ "$d" = y ] && echo Y/n || echo y/N)] " a
+  [[ "${a:-$d}" =~ ^[Yy] ]]
+}
+need(){
+  command -v "$1" >/dev/null && return 0
+  info "installing $2..."
+  [ "$DRY" = 1 ] && return 0
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$2" >/dev/null || die "could not install $2 (sudo apt install $2)"
+}
+human(){ numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0} bytes"; }
+# nearest folder that exists (for df on a folder that is not created yet)
+existing(){ local p=$1; while [ ! -e "$p" ] && [ "$p" != / ]; do p=$(dirname "$p"); done; echo "$p"; }
+where(){ df -h --output=source,avail,target "$(existing "$1")" 2>/dev/null | awk 'NR==2{print "(drive "$1", mounted at "$3", "$2" free)"}'; }
+
+# ---------------------------------------------------------------- drives
+list_disks(){
+  lsblk -dpnro NAME,TYPE 2>/dev/null | awk -v l="$ALLOW_LOOP" '$2=="disk" || (l=="1" && $2=="loop"){print $1}' |
+    grep -vE '^/dev/(zram|ram|sr)' || true
+}
+# disks that hold Ubuntu itself (/, /boot, /boot/efi, swap) - including all members if / is on RAID or LVM
+system_disks(){
+  local s
+  { findmnt -rno SOURCE /; findmnt -rno SOURCE /boot; findmnt -rno SOURCE /boot/efi; swapon --show=NAME --noheadings; } 2>/dev/null |
+  while read -r s; do
+    s=${s%%[*}; [ -b "$s" ] || continue
+    lsblk -nspro NAME,TYPE "$s" 2>/dev/null | awk '$2=="disk"{print $1}'
+  done | sort -u
+}
+# sets STATE (system|mounted|member|data|empty) and STATE_TXT for one disk
+disk_state(){
+  local d=$1 mp types fs
+  if system_disks | grep -qx "$d"; then STATE=system; STATE_TXT="system disk (Ubuntu is on it) - cannot be used"; return; fi
+  mp=$(lsblk -nrpo MOUNTPOINT "$d" 2>/dev/null | awk 'NF' | sort -u | head -3 | tr '\n' ' ')
+  if [ -n "$mp" ]; then STATE=mounted; STATE_TXT="in use - mounted at ${mp% }"; return; fi
+  types=" $(lsblk -nrpo TYPE "$d" 2>/dev/null | sort -u | tr '\n' ' ')"
+  if [[ "$types" =~ \ (raid[0-9]+|linear|lvm|crypt|md)\  ]]; then
+    STATE=member; STATE_TXT="part of a RAID / LVM / encrypted volume - stop or remove that first"; return
+  fi
+  fs=$(lsblk -nrpo FSTYPE,LABEL "$d" 2>/dev/null | awk 'NF' | sort -u | head -2 | tr '\n' ' ')
+  if [ -z "$fs" ]; then      # read the signatures from the disk itself (works even if udev has not caught up)
+    fs=$(for x in $(lsblk -nrpo NAME "$d" 2>/dev/null); do wipefs --noheadings --output TYPE,LABEL "$x" 2>/dev/null; done |
+         awk 'NF' | sort -u | head -2 | tr -s ' ' | tr '\n' ' ')
+  fi
+  if [ -n "$fs" ]; then STATE=data; STATE_TXT="has data (${fs% }) - will be ERASED if chosen"; return; fi
+  STATE=empty; STATE_TXT="empty - ready to use"
+}
+kind(){ local r; r=$(lsblk -dno ROTA "$1" 2>/dev/null | tr -d ' ')
+  if [ "$r" = 1 ]; then echo HDD; elif [[ "$1" == *nvme* ]]; then echo NVMe; else echo SSD; fi; }
+show_drives(){
+  DISKS=()
+  local i=0 d size model
+  printf "  %-3s %-14s %-8s %-5s %-26s %s\n" "#" Drive Size Type Model State
+  while read -r d; do
+    [ -n "$d" ] || continue
+    i=$((i + 1)); DISKS+=("$d"); disk_state "$d"
+    size=$(lsblk -dno SIZE "$d" | tr -d ' '); model=$(lsblk -dno MODEL "$d" | sed "s/^ *//; s/ *$//")
+    printf "  %-3s %-14s %-8s %-5s %-26s %s\n" "$i" "$d" "$size" "$(kind "$d")" "${model:0:26}" "$STATE_TXT"
+  done < <(list_disks)
+  [ "$i" -gt 0 ] || info "no drives found"
+}
+pick(){
+  [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le "${#DISKS[@]}" ] || die "no drive number $1"
+  echo "${DISKS[$(($1 - 1))]}"
+}
+resolve_disk(){
+  local d; d=$(readlink -f "$1" 2>/dev/null)
+  [ -n "$d" ] && [ -b "$d" ] || die "no such drive: $1"
+  list_disks | grep -qx "$d" || die "$1 is not a whole drive - give the drive (e.g. /dev/sdb), not a partition (e.g. /dev/sdb1)"
+  echo "$d"
+}
+check_erasable(){
+  disk_state "$1"
+  case $STATE in system|mounted|member) die "$1 cannot be used: $STATE_TXT";; esac
+}
+show_raid(){
+  if [ -r /proc/mdstat ] && grep -q '^md' /proc/mdstat; then
+    echo; info "RAID status (/proc/mdstat):"; grep -vE '^(Personalities|unused devices)' /proc/mdstat | sed 's/^/    /'
+  else
+    info "no RAID arrays on this server"
+  fi
+}
+show_current(){
+  info "Models:  $(conf_get MODELS_DIR /opt/ai/models)  $(where "$(conf_get MODELS_DIR /opt/ai/models)")"
+  info "Backups: $(conf_get BACKUP_DIR /opt/ai/backups)  $(where "$(conf_get BACKUP_DIR /opt/ai/backups)")"
+}
+# first free mount point: /mnt/ai-storage, /mnt/ai-storage2, ...
+next_mount(){
+  local n="" mp
+  while :; do
+    mp=/mnt/ai-storage$n
+    if ! mountpoint -q "$mp" && ! grep -qE "^[^#]*[[:space:]]${mp}[[:space:]]" /etc/fstab && [ -z "$(ls -A "$mp" 2>/dev/null)" ]; then
+      echo "$mp"; return
+    fi
+    n=$(( ${n:-1} + 1 ))
+  done
+}
+
+# ---------------------------------------------------------------- erase + format
+# new GPT with one partition over the whole disk; prints the partition path
+partition(){
+  local d=$1 kind=$2 p
+  if [ "$DRY" = 1 ]; then
+    echo "  [dry-run] wipe $d and create one $kind partition" >&2
+    if [[ "$d" =~ [0-9]$ ]]; then echo "${d}p1"; else echo "${d}1"; fi; return
+  fi
+  # shellcheck disable=SC2046   # one word per device: old partitions first, then the disk
+  wipefs -aq $(lsblk -nrpo NAME "$d" | tac) >/dev/null 2>&1
+  parted -s -a optimal "$d" mklabel gpt mkpart "$LABEL" ext4 1MiB 100% >/dev/null 2>&1 || die "could not partition $d"
+  [ "$kind" = raid ] && parted -s "$d" set 1 raid on >/dev/null 2>&1
+  for _ in $(seq 1 20); do
+    partprobe "$d" >/dev/null 2>&1; udevadm settle >/dev/null 2>&1
+    p=$(lsblk -nrpo NAME,TYPE "$d" | awk '$2=="part"{print $1; exit}')
+    [ -n "$p" ] && [ -b "$p" ] && { wipefs -aq "$p" >/dev/null 2>&1; echo "$p"; return; }
+    sleep 0.5
+  done
+  die "the new partition on $d did not appear - restart the server and try again"
+}
+add_fstab(){
+  local dev=$1 uuid
+  if [ "$DRY" = 1 ]; then echo "  [dry-run] add $dev to /etc/fstab and mount it at $MP"; return; fi
+  udevadm settle >/dev/null 2>&1
+  uuid=$(blkid -p -s UUID -o value "$dev" 2>/dev/null)
+  [ -n "$uuid" ] || die "could not read the ID of $dev"
+  cp /etc/fstab "/etc/fstab.before-ai-storage.$(date +%Y%m%d-%H%M%S)"
+  { grep -vE "^[^#]*[[:space:]]${MP}[[:space:]]" /etc/fstab || true
+    echo "UUID=$uuid $MP ext4 defaults,nofail,x-systemd.device-timeout=30s 0 2"; } > /etc/fstab.ai-new
+  cat /etc/fstab.ai-new > /etc/fstab && rm -f /etc/fstab.ai-new
+  mkdir -p "$MP"; systemctl daemon-reload >/dev/null 2>&1
+  mount "$MP" 2>/dev/null || mount -t ext4 "$dev" "$MP" || die "could not mount $dev at $MP"
+  mountpoint -q "$MP" || die "$MP is not mounted"
+  info "mounted at $MP (listed in /etc/fstab, so it comes back after a restart)"
+}
+setup_drive(){
+  local d=$1 p
+  need parted parted
+  p=$(partition "$d" ext4) || exit 1
+  info "formatting $p (ext4, label $LABEL)..."
+  run mkfs.ext4 -F -q -m 1 -L "$LABEL" "$p" || die "formatting failed"
+  add_fstab "$p"
+}
+setup_raid(){
+  local level=$1; shift
+  local parts=() d p md out
+  need parted parted; need mdadm mdadm
+  for d in "$@"; do p=$(partition "$d" raid) || exit 1; parts+=("$p"); done
+  info "creating RAID $level from ${parts[*]}..."
+  if [ "$DRY" = 1 ]; then
+    echo "  [dry-run] mdadm --create /dev/md/$LABEL --level=$level --raid-devices=$# ${parts[*]}"
+    echo "  [dry-run] mkfs.ext4 -L $LABEL /dev/md/$LABEL"; add_fstab "/dev/md/$LABEL"; return
+  fi
+  for p in "${parts[@]}"; do mdadm --zero-superblock --force "$p" >/dev/null 2>&1; done
+  out=$(mdadm --create "/dev/md/$LABEL" --level="$level" --raid-devices=$# --metadata=1.2 --name="$LABEL" --run "${parts[@]}" 2>&1 <<<"y") ||
+    die "RAID creation failed: $out"
+  udevadm settle >/dev/null 2>&1
+  md=$(readlink -f "/dev/md/$LABEL"); [ -b "$md" ] || die "the RAID device did not appear"
+  info "formatting $md (ext4, label $LABEL)..."
+  mkfs.ext4 -F -q -m 1 -L "$LABEL" "$md" || die "formatting the RAID failed"
+  mkdir -p /etc/mdadm; touch /etc/mdadm/mdadm.conf
+  { grep -vE "^ARRAY /dev/md/$LABEL( |$)" /etc/mdadm/mdadm.conf || true; mdadm --detail --brief "/dev/md/$LABEL"; } > /etc/mdadm/mdadm.conf.ai-new
+  cat /etc/mdadm/mdadm.conf.ai-new > /etc/mdadm/mdadm.conf && rm -f /etc/mdadm/mdadm.conf.ai-new
+  if command -v update-initramfs >/dev/null; then info "updating boot files so the RAID starts at boot..."; update-initramfs -u >/dev/null 2>&1; fi
+  add_fstab "$md"
+  if [ "$level" != 0 ]; then
+    info "The RAID is usable now. It builds its redundancy in the background (hours for big drives);"
+    info "it is a bit slower until then. Progress: control panel > Health, or  cat /proc/mdstat"
+  fi
+}
+
+# ---------------------------------------------------------------- moving the models / backups
+STOPPED=()
+pause_ai(){
+  local u
+  for u in ai-model-download llama-swap; do
+    if systemctl is-active -q "$u" 2>/dev/null; then run systemctl stop "$u"; STOPPED+=("$u"); fi
+  done
+  [ ${#STOPPED[@]} -gt 0 ] && info "paused: ${STOPPED[*]}"
+  trap resume_ai EXIT
+}
+resume_ai(){
+  local i
+  for ((i = ${#STOPPED[@]} - 1; i >= 0; i--)); do run systemctl start --no-block "${STOPPED[$i]}"; done
+  [ ${#STOPPED[@]} -gt 0 ] && info "started again: ${STOPPED[*]}"
+  STOPPED=(); trap - EXIT
+}
+re_esc(){ printf '%s' "$1" | sed 's/[][\.*^$#\\]/\\&/g'; }
+rep_esc(){ printf '%s' "$1" | sed 's/[#&\\]/\\&/g'; }
+# move_dir MODELS_DIR|BACKUP_DIR <new folder>
+move_dir(){
+  local key=$1 new=$2 def what old oldr need avail left
+  if [ "$key" = MODELS_DIR ]; then def=/opt/ai/models; what="models"; else def=/opt/ai/backups; what="backups"; fi
+  old=$(conf_get "$key" "$def"); oldr=$(realpath -m "$old"); new=$(realpath -m "$new")
+  if [ "$oldr" = "$new" ]; then info "$what already in $new"; return; fi
+  case "$new/" in "$oldr/"*) die "the new folder $new is inside the old one ($oldr) - choose another place";; esac
+  case "$oldr/" in "$new/"*) die "the old folder $oldr is inside the new one ($new) - choose another place";; esac
+  run mkdir -p "$new"
+  if [ "$key" = MODELS_DIR ]; then run chown "$ADMIN:$ADMIN" "$new"; run chmod 755 "$new"
+  else run chown root:root "$new"; run chmod 700 "$new"; fi
+
+  if [ -d "$oldr" ] && [ -n "$(ls -A "$oldr" 2>/dev/null)" ]; then
+    need=$(du -sb "$oldr" 2>/dev/null | cut -f1)
+    [ "$key" = MODELS_DIR ] && pause_ai
+    if [ "$DRY" != 1 ] && [ "$(stat -c %d "$oldr")" = "$(stat -c %d "$new")" ]; then
+      info "moving $what ($(human "$need")) to $new (same drive - instant)..."
+      find "$oldr" -mindepth 1 -maxdepth 1 -exec mv -t "$new" {} + || die "move failed - check $oldr and $new"
+    else
+      avail=$(df -B1 --output=avail "$(existing "$new")" | tail -1 | tr -d ' ')
+      if [ "$DRY" != 1 ] && [ "$avail" -lt $((need + 536870912)) ]; then
+        die "not enough space for the $what in $new: need $(human "$need") + 0.5 GB, only $(human "$avail") free. The $what stay in $oldr."
+      fi
+      info "copying $what ($(human "$need")) to $new - this can take a while..."
+      run rsync -aH --info=progress2 "$oldr"/ "$new"/ || die "copy failed - nothing was changed, the $what are still in $oldr"
+      if [ "$DRY" != 1 ]; then
+        left=$(rsync -aHn --itemize-changes "$oldr"/ "$new"/ | head -1)
+        [ -z "$left" ] || die "copy check failed ($left) - nothing was changed, the $what are still in $oldr"
+      fi
+      if [ "$key" = MODELS_DIR ]; then run chown "$ADMIN:$ADMIN" "$new"; run chmod 755 "$new"
+      else run chown root:root "$new"; run chmod 700 "$new"; fi
+    fi
+  fi
+
+  [ "$key" = MODELS_DIR ] && [ -d "$new" ] && run chown -R "$ADMIN:$ADMIN" "$new"   # the panel adds/removes models as the admin user
+  if [ "$key" = MODELS_DIR ] && [ -f "$SWAP_YAML" ]; then      # model paths in the llama-swap config
+    run cp "$SWAP_YAML" "$SWAP_YAML.before-storage"
+    local o
+    for o in "$old" "$oldr"; do run sed -i "s#$(re_esc "${o%/}")/#$(rep_esc "$new")/#g" "$SWAP_YAML"; done
+    [ "$DRY" = 1 ] || chown "$ADMIN:$ADMIN" "$SWAP_YAML"
+  fi
+  conf_set "$key" "$new"
+
+  # remove the old copy, but only if it holds nothing except model / backup files
+  if [ -d "$oldr" ] && [ -n "$(ls -A "$oldr" 2>/dev/null)" ]; then
+    if [ "$key" = BACKUP_DIR ] || [ -z "$(find "$oldr" -type f ! -name '*.gguf' ! -name '*.part' ! -name '*.bin' ! -name '*.safetensors' 2>/dev/null | head -1)" ]; then
+      run find "$oldr" -mindepth 1 -delete && info "removed the old copy from $oldr"
+    else
+      info "the old folder $oldr also has other files - kept it. Delete it yourself once everything works."
+    fi
+  fi
+  case "$oldr" in /opt/ai/*) ;; *) [ "$DRY" = 1 ] || rmdir "$oldr" 2>/dev/null || true;; esac   # tidy an empty old folder
+  [ "$key" = MODELS_DIR ] && resume_ai
+  info "$what are now in $new"
+}
+
+check_path(){
+  [[ "$1" =~ ^/[A-Za-z0-9._/+-]+$ ]] && [[ "$1" != *..* ]] ||
+    die "use a simple full path like /mnt/data/ai-models (letters, numbers and . _ - + / only)"
+  local p; p=$(realpath -m "$1")
+  case "$p" in
+    /opt/ai/models|/opt/ai/backups) ;;
+    /|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run|/run/*|/tmp|/tmp/*|/boot|/boot/*|/etc|/etc/*|/usr|/usr/*|/bin|/bin/*|/sbin|/sbin/*|/lib*|/var/lib/docker*|/root|/root/*|/opt/ai|/opt/ai/*)
+      die "$p is a system folder - choose another place (for example a folder on a data drive under /mnt)";;
+  esac
+  # a folder that is not empty gets a sub-folder, so the models never mix with other files
+  if [ -d "$p" ] && [ -n "$(ls -A "$p" 2>/dev/null)" ] && [ "$p" != /opt/ai/models ] && [ "$p" != /opt/ai/backups ] &&
+     [ -n "$(find "$p" -maxdepth 1 -mindepth 1 ! -name '*.gguf' ! -name '*.part' ! -name '*.tgz' ! -name '20*' 2>/dev/null | head -1)" ]; then
+    p="$p/${SUBDIR}"
+    info "that folder already has other files - using the sub-folder $p" >&2
+  fi
+  echo "$p"
+}
+# warn about drives that are slow, temporary or Windows-formatted
+check_drive_of(){
+  local p fs tgt
+  p=$(existing "$1"); fs=$(findmnt -no FSTYPE -T "$p" | head -1); tgt=$(findmnt -no TARGET -T "$p" | head -1)
+  case $fs in
+    vfat|exfat|ntfs|ntfs3|fuseblk|msdos)
+      warn "$tgt is a Windows-format drive ($fs). It works but is slower and Linux permissions do not apply."
+      warn "Recommended: 'drive' mode, which formats it as ext4 (erases it)."
+      [ "$ACCEPT" = 1 ] || ask "Use it anyway?" n || die "cancelled - nothing was changed";;
+    nfs|nfs4|cifs|smb3|fuse.*)
+      warn "$tgt is a network drive ($fs). Loading models over the network is slow."
+      [ "$ACCEPT" = 1 ] || ask "Use it anyway?" n || die "cancelled - nothing was changed";;
+  esac
+  if [ "$tgt" != / ] && [ -z "$(findmnt -s -no TARGET "$tgt" 2>/dev/null)" ]; then
+    warn "$tgt is not in /etc/fstab, so it may not be there after a restart (then the AI cannot find its models)."
+    [ "$ACCEPT" = 1 ] || ask "Use it anyway?" n || die "cancelled - nothing was changed"
+  fi
+  info "free space there: $(df -h --output=avail "$p" | tail -1 | tr -d ' ')"
+}
+
+# ---------------------------------------------------------------- commands
+cmd_folder(){
+  [ -n "${1:-}" ] || die "which folder? e.g.  sudo ai-storage folder /mnt/data/ai-models"
+  local p; SUBDIR=ai-models; p=$(check_path "$1") || exit 1
+  check_drive_of "$p"
+  move_dir MODELS_DIR "$p"
+}
+cmd_backups(){
+  [ -n "${1:-}" ] || die "which folder? e.g.  sudo ai-storage backups /mnt/data/ai-backups"
+  local p; SUBDIR=ai-backups; p=$(check_path "$1") || exit 1
+  check_drive_of "$p"
+  move_dir BACKUP_DIR "$p"
+}
+decide_backups(){      # $1 = 1 if the new storage survives a dead drive / is a separate drive
+  case $BACKUPS in
+    yes) BK=yes; [ "$1" = 1 ] || warn "RAID 0 loses everything if one drive dies - not a safe place for backups";;
+    no) BK=no;;
+    *) if [ "$1" = 1 ]; then ask "Also keep the nightly backups there (recommended: they are then on a different drive than the system)?" y && BK=yes || BK=no
+       else BK=no; info "backups stay where they are (RAID 0 is not a safe place for backups)"; fi;;
+  esac
+}
+# stop before erasing anything if the new storage cannot hold what is already there
+space_check(){
+  local need b
+  need=$(du -sb "$(conf_get MODELS_DIR /opt/ai/models)" 2>/dev/null | cut -f1); need=${need:-0}
+  if [ "$BK" = yes ]; then b=$(du -sb "$(conf_get BACKUP_DIR /opt/ai/backups)" 2>/dev/null | cut -f1); need=$((need + ${b:-0})); fi
+  [ $((need + 536870912)) -lt $(($1 * 95 / 100)) ] ||
+    die "the new storage (about $(human "$1")) is too small for what is already there ($(human "$need")) - nothing was changed"
+}
+finish_storage(){
+  run mkdir -p "$MP/models"
+  move_dir MODELS_DIR "$MP/models"
+  [ "$BK" = yes ] && move_dir BACKUP_DIR "$MP/backups"
+  echo; info "Done."; show_current
+}
+cmd_drive(){
+  [ -n "${1:-}" ] || die "which drive? see  sudo ai-storage list"
+  local d; d=$(resolve_disk "$1") || exit 1
+  check_erasable "$d"
+  MP=$(next_mount); LABEL=$(basename "$MP")
+  echo; info "Plan: erase $d ($(lsblk -dno SIZE "$d" | tr -d ' ') $(kind "$d")), format it, mount it at $MP and keep the models in $MP/models"
+  decide_backups 1
+  space_check "$(lsblk -bdno SIZE "$d" | tr -d ' ')"
+  confirm_erase "$d"
+  setup_drive "$d"
+  finish_storage
+}
+raid_help(){
+  info "RAID 0  - 2+ drives. Fastest and all space usable, but if ANY drive dies everything on it is lost."
+  info "          OK for models (they can be downloaded again), not for backups."
+  info "RAID 1  - 2+ drives, every drive holds the same copy. Keeps working if a drive dies. Space = one drive."
+  info "RAID 5  - 3+ drives. Keeps working if one drive dies. Space = all drives minus one."
+  info "RAID 10 - 4+ drives. Fast and keeps working if a drive dies. Space = half of all drives."
+  info "RAID is not a backup: deleted files are deleted on every drive."
+}
+cmd_raid(){
+  local level=${1:-}; shift || true
+  local ds=() d min sizes s small=0 kinds n cap
+  case $level in 0|1|5|10) ;; *) die "RAID level must be 0, 1, 5 or 10 (e.g.  sudo ai-storage raid 1 /dev/sdb /dev/sdc)";; esac
+  for d in "$@"; do
+    d=$(resolve_disk "$d") || exit 1
+    [ ${#ds[@]} -gt 0 ] && printf '%s\n' "${ds[@]}" | grep -qx "$d" && die "$d is listed twice"
+    ds+=("$d")
+  done
+  case $level in 0|1) min=2;; 5) min=3;; 10) min=4;; esac
+  n=${#ds[@]}
+  [ "$n" -ge "$min" ] || die "RAID $level needs at least $min drives (you gave $n)"
+  for d in "${ds[@]}"; do check_erasable "$d"; done
+  sizes=""; kinds=""
+  for d in "${ds[@]}"; do s=$(lsblk -bdno SIZE "$d" | tr -d ' '); sizes+="$s "; kinds+="$(kind "$d") "
+    if [ "$small" = 0 ] || [ "$s" -lt "$small" ]; then small=$s; fi; done
+  case $level in 0) cap=$((small * n));; 1) cap=$small;; 5) cap=$((small * (n - 1)));; 10) cap=$((small * n / 2));; esac
+  MP=$(next_mount); LABEL=$(basename "$MP")
+  echo; info "Plan: RAID $level of $n drives (${ds[*]}) = about $(human "$cap") usable, mounted at $MP, models in $MP/models"
+  [ "$(echo "$sizes" | tr ' ' '\n' | awk 'NF' | sort -u | wc -l)" -gt 1 ] &&
+    info "note: the drives have different sizes - every drive is used only up to the size of the smallest one."
+  [ "$(echo "$kinds" | tr ' ' '\n' | awk 'NF' | sort -u | wc -l)" -gt 1 ] &&
+    info "note: mixing HDD and SSD works, but the RAID runs at the speed of the slowest drive."
+  decide_backups "$([ "$level" = 0 ] && echo 0 || echo 1)"
+  space_check "$cap"
+  confirm_erase "${ds[@]}"
+  setup_raid "$level" "${ds[@]}"
+  finish_storage
+}
+confirm_erase(){
+  local d a
+  echo
+  warn "EVERYTHING on these drives will be erased:"
+  for d in "$@"; do disk_state "$d"; echo "     $d  $(lsblk -dno SIZE,MODEL "$d" | sed "s/^ *//; s/ *$//")  - $STATE_TXT" >&2; done
+  [ "$DRY" = 1 ] && { info "(dry run - nothing will be erased)"; return 0; }
+  [ "$YES" = 1 ] && return 0
+  [ -t 0 ] || die "not erasing without confirmation: run it in a terminal, or set STORAGE_ERASE_OK=yes in config.env"
+  read -r -p "  Type ERASE to continue (anything else cancels): " a
+  [ "$a" = ERASE ] || die "cancelled - nothing was changed"
+}
+cmd_apply(){
+  local spec=${1:-} l ds
+  if [ -n "$spec" ] && [ "$spec" = "$(conf_get STORAGE_SPEC)" ]; then info "storage is already set up as '$spec' - nothing to do"; return; fi
+  case $spec in
+    ""|system|none) info "models stay in $(conf_get MODELS_DIR /opt/ai/models)"; return;;
+    folder:*) cmd_folder "${spec#folder:}";;
+    drive:*) cmd_drive "${spec#drive:}";;
+    raid0:*|raid1:*|raid5:*|raid10:*)
+      l=${spec%%:*}; l=${l#raid}; IFS=', ' read -r -a ds <<< "${spec#*:}"; cmd_raid "$l" "${ds[@]}";;
+    *) die "STORAGE='$spec' is not understood. Examples:  folder:/mnt/data/ai-models   drive:/dev/sdb   raid1:/dev/sdb,/dev/sdc";;
+  esac
+  conf_set STORAGE_SPEC "$spec"
+}
+menu(){
+  local c p n l ns ds=() x others
+  echo
+  if [ "$FIRST" = 1 ]; then
+    others=0
+    for x in $(list_disks); do disk_state "$x"; [ "$STATE" != system ] && others=1; done
+    if [ "$others" = 0 ]; then
+      info "Models are stored in $(conf_get MODELS_DIR /opt/ai/models) (no other drives found)."
+      info "If you add a drive later:  sudo ai-storage"; return
+    fi
+    echo "  Where should the AI models be stored? (models are big: 3-30 GB each)"
+  else
+    echo "  Home AI storage - where the models and backups are kept"
+  fi
+  show_current; echo
+  echo "  1) Keep it as it is"
+  echo "  2) Use a folder on a drive that is already set up (erases nothing)"
+  echo "  3) Use one whole drive (ERASES it)"
+  echo "  4) Combine several drives into a RAID (ERASES them)"
+  echo "  5) Move only the nightly backups"
+  echo "  6) Show drives and RAID status"
+  read -r -p "  Choose [1]: " c
+  case ${c:-1} in
+    1) info "nothing changed. You can change this any time:  sudo ai-storage";;
+    2) echo; show_drives; echo; info "Mounted drives: $(findmnt -rno TARGET -t ext4,xfs,btrfs,ntfs3,ntfs,exfat,vfat,fuseblk | grep -vE '^/(boot|snap)' | tr '\n' ' ')"
+       read -r -p "  Folder (full path, e.g. /mnt/data/ai-models): " p; cmd_folder "$p";;
+    3) echo; show_drives; echo; read -r -p "  Drive number: " n; cmd_drive "$(pick "$n")";;
+    4) echo; raid_help; echo; read -r -p "  RAID level (0, 1, 5 or 10): " l
+       echo; show_drives; echo; read -r -p "  Drive numbers, separated by spaces (e.g. 2 3): " ns
+       for n in $ns; do x=$(pick "$n") || exit 1; ds+=("$x"); done
+       cmd_raid "$l" "${ds[@]}";;
+    5) read -r -p "  Folder for the backups (full path): " p; cmd_backups "$p";;
+    6) echo; show_drives; show_raid;;
+    *) die "no option $c";;
+  esac
+}
+
+cmd_json(){
+  local d
+  {
+    printf 'models_dir\t%s\n' "$(conf_get MODELS_DIR /opt/ai/models)"
+    printf 'backup_dir\t%s\n' "$(conf_get BACKUP_DIR /opt/ai/backups)"
+    printf 'models_where\t%s\n' "$(where "$(conf_get MODELS_DIR /opt/ai/models)")"
+    printf 'backup_where\t%s\n' "$(where "$(conf_get BACKUP_DIR /opt/ai/backups)")"
+    while read -r d; do
+      [ -n "$d" ] || continue
+      disk_state "$d"
+      printf 'disk\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$d" "$(lsblk -bdno SIZE "$d" | tr -d ' ')" "$(lsblk -dno SIZE "$d" | tr -d ' ')" \
+        "$(kind "$d")" "$(lsblk -dno MODEL "$d" | tr '\t' ' ' | sed 's/^ *//; s/ *$//')" "$STATE" "$STATE_TXT"
+    done < <(list_disks)
+  } | python3 -I -c '
+import sys, json
+o = {"disks": []}
+for l in sys.stdin.read().splitlines():
+    f = l.split("\t")
+    if f[0] == "disk" and len(f) == 8:
+        d = dict(zip(["dev", "bytes", "size", "kind", "model", "state", "state_txt"], f[1:]))
+        d["bytes"] = int(d["bytes"] or 0); d["ok"] = d["state"] in ("empty", "data"); o["disks"].append(d)
+    elif len(f) == 2: o[f[0]] = f[1]
+print(json.dumps(o))'
+}
+# start folder/backups/drive/raid in the background; progress goes to $JOBLOG, the last line is AI-STORAGE-EXIT=<code>
+cmd_job(){
+  local self
+  case ${1:-} in folder|backups|drive|raid) ;; *) die "job: the command must be folder, backups, drive or raid";; esac
+  exec 9>"$LOCK"; flock -n 9 || die "a storage job is already running - wait for it to finish"; flock -u 9; exec 9>&-
+  self=$(readlink -f "$0")
+  : > "$JOBLOG"; chmod 644 "$JOBLOG"
+  echo "== $(date '+%Y-%m-%d %H:%M:%S')  ai-storage $*" >> "$JOBLOG"
+  if command -v systemd-run >/dev/null && [ -d /run/systemd/system ]; then
+    systemctl reset-failed ai-storage-job >/dev/null 2>&1
+    systemd-run --unit=ai-storage-job --collect --quiet -p StandardOutput=append:"$JOBLOG" -p StandardError=inherit \
+      /bin/sh -c '"$0" "$@"; echo "AI-STORAGE-EXIT=$?"' "$self" "$@" || die "could not start the storage job"
+  else
+    setsid nohup /bin/sh -c '"$0" "$@"; echo "AI-STORAGE-EXIT=$?"' "$self" "$@" >> "$JOBLOG" 2>&1 < /dev/null &
+  fi
+  echo "Started. Progress: $JOBLOG"
+}
+
+# ---------------------------------------------------------------- main
+if [ "${1:-}" = job ]; then          # flags are passed on unchanged to the background run
+  [ "$(id -u)" -eq 0 ] || die "run it with sudo:  sudo ai-storage"
+  [ -f "$CONF" ] || die "Home AI Cluster is not installed yet"
+  shift; cmd_job "$@"; exit $?
+fi
+ARGS=()
+for a in "$@"; do
+  case $a in
+    --dry-run) DRY=1;; --yes) YES=1;; --accept-warnings) ACCEPT=1;; --backups) BACKUPS=yes;; --no-backups) BACKUPS=no;; --first-run) FIRST=1;;
+    -h|--help|help) usage;;
+    *) ARGS+=("$a");;
+  esac
+done
+set -- "${ARGS[@]}"
+[ "$(id -u)" -eq 0 ] || die "run it with sudo:  sudo ai-storage"
+[ -f "$CONF" ] || die "Home AI Cluster is not installed yet ($CONF missing) - run  sudo bash install.sh  first"
+ADMIN=$(conf_get ADMIN)
+[ -n "$ADMIN" ] || die "ADMIN is missing in $CONF - run  sudo bash install.sh  again"
+cmd=${1:-menu}; shift || true
+case $cmd in              # only one change at a time (the control panel also reads this lock to see a running job)
+  menu|folder|backups|drive|raid|apply) exec 9>"$LOCK"; flock -n 9 || die "ai-storage is already running (maybe from the control panel) - wait for it to finish";;
+esac
+[ "$DRY" = 1 ] && info "DRY RUN - nothing will be changed"
+case $cmd in
+  menu) menu;;
+  list|status) show_current; echo; show_drives; show_raid;;
+  folder) cmd_folder "${1:-}";;
+  backups) cmd_backups "${1:-}";;
+  drive) cmd_drive "${1:-}";;
+  raid) cmd_raid "$@";;
+  apply) cmd_apply "${1:-}";;
+  json) cmd_json;;
+  *) die "unknown command '$cmd' - see  sudo ai-storage --help";;
+esac
