@@ -2,7 +2,7 @@
 """Home AI Cluster - control panel (port 8091): models, GPUs, server + drive health, adding GPU PCs, settings.
 Runs on the AI server as the admin user. Usable from any home device after logging in with the admin password.
 The admin password is created once with the setup code printed by the installer (or from ADMIN_PC_IP)."""
-import fcntl, json, os, re, glob, time, subprocess, ipaddress, urllib.request, urllib.parse, argparse, hashlib, hmac, secrets, threading
+import fcntl, json, os, re, glob, time, subprocess, ipaddress, urllib.request, urllib.parse, argparse, hashlib, hmac, secrets, threading, signal
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 
@@ -215,32 +215,178 @@ def probe_worker(w):
         o = subprocess.run([LLAMA, "--rpc", w, "--list-devices"], capture_output=True, text=True, timeout=6).stdout
         m = re.search(r"RPC\d+: \S+ \((\d+) MiB, (\d+) MiB free\)", o)
         if m: return {"online": True, "total": int(m.group(1)), "used": int(m.group(1)) - int(m.group(2))}
-        return {"online": True, "busy": True}
+        return {"online": True, "slow": True}
     except subprocess.TimeoutExpired:
-        return {"online": True, "busy": True}
+        return {"online": True, "slow": True}
     except Exception:
         return {"online": False}
 
 
+def workers_in_use():
+    """GPU PCs that a running llama-server is connected to right now (from its --rpc list).
+    A GPU PC serves one model at a time and doesn't answer other connections meanwhile,
+    so without this check it would look offline exactly while it is working."""
+    used = set()
+    try: out = subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True, timeout=5).stdout
+    except Exception: return used
+    for line in out.splitlines():
+        if os.path.basename(line.split(" ", 1)[0]) != "llama-server": continue
+        for m in re.finditer(r"--rpc[ =](\S+)", line):
+            used.update(w.strip() for w in m.group(1).split(",") if RE_WORKER.match(w.strip()))
+    return used
+
+
+# ---------------------------------------------------------------- GPU auto-off
+# Each GPU PC reports how much its OWN programs (a game, video...) use its GPU (gpu-status on port 50053).
+# Above the limit for two checks in a row, the GPU is switched to Off and the models using it are stopped
+# (they restart without it on the next message). After N minutes below the limit it goes back to its old mode.
+GUARD = "/opt/ai/gpu-guard.json"
+STATUS_PORT = 50053
+_guard = {"hits": {}}
+_guard_lock = threading.Lock()
+
+
+def _guard_note(text):
+    try:
+        os.makedirs("/var/lib/home-ai", exist_ok=True)
+    except OSError: pass
+    notify(text)
+
+
+def guard_settings(pol=None):
+    pol = pol if pol is not None else jload(POL, {})
+    try: pct = max(0, min(100, int(pol.get("auto_off_pct", 40))))
+    except (TypeError, ValueError): pct = 40
+    try: back = max(1, min(120, int(pol.get("auto_back_min", 5))))
+    except (TypeError, ValueError): back = 5
+    return pct, back
+
+
+def set_guard_settings(pct, back):
+    try: pct, back = int(pct), int(back)
+    except (TypeError, ValueError): raise ValueError("Use whole numbers.")
+    if not (0 <= pct <= 100 and 1 <= back <= 120): raise ValueError("Use 0-100 % (0 = never) and 1-120 minutes.")
+    pol = jload(POL, {}); pol["auto_off_pct"] = pct; pol["auto_back_min"] = back
+    write_file(POL, json.dumps(pol, indent=1), 0o644)
+    if pct == 0: return "Saved. GPU PCs are never switched off automatically."
+    return f"Saved. A GPU PC switches to Off while its own programs use its GPU more than {pct}%, and goes back after {back} min below that."
+
+
+def stop_models_on(w):
+    """Stop the llama-server processes that use GPU PC w; llama-swap starts them again without it on the next message."""
+    try: out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True, timeout=5).stdout
+    except Exception: return 0
+    n = 0
+    for line in out.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        exe = args.split(" ", 1)[0]
+        if os.path.basename(exe) == "llama-server" and any(w in m.group(1).split(",") for m in re.finditer(r"--rpc[ =](\S+)", args)):
+            try: os.kill(int(pid), signal.SIGTERM); n += 1
+            except (OSError, ValueError): pass
+    return n
+
+
+def _guard_set_mode(w, mode):
+    pol = jload(POL, {}); pol.setdefault("workers", {})[w] = mode
+    write_file(POL, json.dumps(pol, indent=1), 0o644)
+
+
+def guard_tick():
+    with _guard_lock: _guard_tick()
+
+
+def forget_gpu(key):
+    """Remove an offline GPU PC (name, mode, auto-off state), e.g. after it got a new IP address."""
+    if not RE_WORKER.match(key): raise ValueError("bad gpu")
+    if key in workers_in_use() or _gpu_cache["workers"].get(key, {}).get("online"):
+        raise ValueError("This GPU PC is online. Only offline GPU PCs can be forgotten.")
+    with _guard_lock:
+        pol = jload(POL, {}); pol.get("workers", {}).pop(key, None); pol.get("names", {}).pop(key, None)
+        write_file(POL, json.dumps(pol, indent=1), 0o644)
+        st = jload(GUARD, {}); st.get("workers", {}).pop(key, None)
+        write_file(GUARD, json.dumps(st, indent=1), 0o644)
+        _gpu_cache["workers"].pop(key, None); _guard["hits"].pop(key, None)
+    return "Forgotten. If a PC answers at that address again, it shows up as a new GPU."
+
+
+def _guard_tick():
+    pol = jload(POL, {}); thr, back = guard_settings(pol)
+    st = jload(GUARD, {}); ws = st.setdefault("workers", {})
+    now = time.time(); names = pol.get("names", {})
+    for w in sorted(set(pol.get("workers", {})) | set(_gpu_cache["workers"]) | set(ws) | workers_in_use()):
+        if not RE_WORKER.match(w): continue
+        e = ws.setdefault(w, {})
+        try:
+            r = json.loads(get(f"http://{w.split(':')[0]}:{STATUS_PORT}/", 3))
+            pct = max(0, min(100, int(r.get("pc_pct", 0))))
+            e.update(reporter=True, pct=pct, top=str(r.get("top") or "")[:60], seen=now)
+        except Exception:
+            e["reporter"] = False; pct = None
+        mode = pol.get("workers", {}).get(w, "use"); name = names.get(w) or w.split(":")[0]
+        if e.get("auto_off") and mode != "off":               # changed by hand in the panel: respect it until the PC is quiet
+            e.update(auto_off=False, hold=True, low_since=None)
+        if pct is None: continue                               # PC off or no reporter: change nothing
+        if e.get("hold") and pct <= thr: e["hold"] = False
+        if e.get("auto_off"):
+            if thr == 0 or pct <= thr:
+                e["low_since"] = e.get("low_since") or now
+                if thr == 0 or now - e["low_since"] >= back * 60:
+                    prev = e.get("prev", "use")
+                    _guard_set_mode(w, prev); e.update(auto_off=False, low_since=None)
+                    _guard_note(f"✅ {name}: auto-off was turned off, so the AI may use this GPU again ({prev})." if thr == 0 else
+                                f"✅ {name}: its PC is free again ({pct}%), so the AI may use this GPU again ({prev}).")
+            else:
+                e["low_since"] = None
+        elif thr > 0 and pct > thr and mode in ("use", "standby") and not e.get("hold"):
+            _guard["hits"][w] = _guard["hits"].get(w, 0) + 1
+            if _guard["hits"][w] >= 2:                             # two checks in a row (about 10 s), not a short spike
+                _guard["hits"][w] = 0
+                _guard_set_mode(w, "off"); e.update(auto_off=True, prev=mode, since=now, low_since=None)
+                n = stop_models_on(w)
+                top = f", {e['top']}" if e.get("top") else ""
+                stopped = f" ({n} model(s) stopped; they restart without it)" if n else ""
+                _guard_note(f"🎮 {name} is busy on its PC ({pct}%{top}). The AI stopped using it{stopped} "
+                            f"and switches it back after {back} min below {thr}%.")
+        else:
+            _guard["hits"][w] = 0
+    write_file(GUARD, json.dumps(st, indent=1), 0o644)
+
+
+def guard_loop():
+    while True:
+        try: guard_tick()
+        except Exception as ex: print("gpu auto-off:", ex, flush=True)
+        time.sleep(5)
+
+
 def gpus():
     pol = jload(POL, {})
+    inuse = workers_in_use()
     if time.time() - _gpu_cache["t"] > 20:
         reach = subprocess.run(["/opt/ai/bin/find-workers.sh"], capture_output=True, text=True, timeout=30).stdout.strip()
         reach = [w for w in reach.split(",") if w]
         ws = {}
-        for w in sorted(set(reach) | set(pol.get("workers", {}))):
-            ws[w] = probe_worker(w) if w in reach else {"online": False}
+        for w in sorted(set(reach) | set(pol.get("workers", {})) | set(_gpu_cache["workers"]) | inuse):
+            if w in inuse: ws[w] = {"online": True, "busy": True}      # don't probe a GPU PC that is working
+            elif w in reach: ws[w] = probe_worker(w)
+            else: ws[w] = {"online": False}
         _gpu_cache.update(t=time.time(), workers=ws)
+    for w in inuse:                                                     # a model may have started since the last scan
+        _gpu_cache["workers"][w] = {"online": True, "busy": True}
     try: running = json.loads(get(f"{SWAP}/running")).get("running", [])
     except Exception: running = []
-    names = pol.get("names", {})
+    names = pol.get("names", {}); gst = jload(GUARD, {}).get("workers", {})
     sg = server_gpu()
     rows = [{"key": "server", "where": f"AI server ({conf().get('SERVER_IP', '')})", **sg, "model": sg.get("name", ""),
              "name": names.get("server") or sg.get("name", "server GPU"), "mode": pol.get("server", "use")}]
     for w, info in _gpu_cache["workers"].items():
+        g = gst.get(w, {})
         rows.append({"key": w, "where": f"GPU worker PC {w.split(':')[0]}", **info, "model": "",
-                     "name": names.get(w) or "worker GPU", "mode": pol.get("workers", {}).get(w, "use")})
-    return {"gpus": rows, "running": running}
+                     "name": names.get(w) or "worker GPU", "mode": pol.get("workers", {}).get(w, "use"),
+                     "pc_pct": g.get("pct") if g.get("reporter") else None, "pc_top": g.get("top", ""),
+                     "reporter": g.get("reporter"), "auto_off": bool(g.get("auto_off"))})
+    pct, back = guard_settings(pol)
+    return {"gpus": rows, "running": running, "guard": {"pct": pct, "back": back}}
 
 
 def set_gpu_name(key, name):
@@ -610,6 +756,9 @@ table{width:100%;border-collapse:collapse}td,th{padding:6px 8px;border-bottom:1p
 <div class="m"><b>Use</b> = every model may use it. <b>Standby</b> = kept ready, only used by big models that need all GPUs (or when nothing else is free).
 <b>Off</b> = never used (e.g. while you game on that PC). Changing a setting stops the running models; they restart with the new choice on the next message.
 Image generation (ComfyUI) is separate and isn't affected.</div>
+<div class="row m">Auto-off: a GPU PC switches to <b>Off</b> while its own programs (a game, a video...) use its GPU more than
+<input id="gap" type="number" min="0" max="100" style="width:4.5em"> % and goes back after <input id="gab" type="number" min="1" max="120" style="width:4.5em"> min
+below that (0 % = never). <button class="s" id="gas">Save</button></div>
 <div id="gl">Loading...</div>
 <h2>Running now</h2><div id="run"></div><div class="row"><button class="s" id="unl">Stop all running models (free all VRAM)</button></div>
 </section>
@@ -667,11 +816,11 @@ Its files stay on that PC; only the GPU is used, and only the AI server may conn
 <li>Double-click <b>add-this-pc.bat</b> and click <b>Yes</b> when Windows asks for permission.</li>
 <li>Wait until it shows <b>WORKER-OK</b> (the first time it downloads ~300 MB).</li>
 <li>Come back to this tab - the new GPU appears in the list below within a minute.</li></ol>
-<div class="m">To remove it later: on that PC open Task Scheduler and delete the task <b>AI GPU Worker</b> (or just set it to <b>Off</b> in the GPUs tab).</div></div>
+<div class="m">To remove it later: on that PC open Task Scheduler and delete the tasks <b>AI GPU Worker</b> and <b>AI GPU Status</b> (or just set it to <b>Off</b> in the GPUs tab).</div></div>
 <div class="card"><h2>Ubuntu / Linux PC</h2><div class="m">On the PC you want to add, open a Terminal and paste this command (it asks for that PC's password):</div>
 <div class="row"><input id="linuxcmd" readonly size="62" style="font-family:ui-monospace,monospace"><button class="s" onclick="cp('linuxcmd')">Copy</button></div>
 <div class="m">If it says an NVIDIA driver was installed, restart that PC and run the same command again.
-To remove it later: <code>sudo systemctl disable --now ai-gpu-worker</code></div></div>
+To remove it later: <code>sudo systemctl disable --now ai-gpu-worker ai-gpu-status</code></div></div>
 <div class="card"><h2>GPU PCs the server can see</h2><div id="wl" class="m">Loading...</div>
 <div class="row"><button class="s" id="rsc">Look for new PCs now</button></div>
 <div class="m">Found it? Go to the <b>GPUs</b> tab to give it a name and choose <b>Use</b>, <b>Standby</b> or <b>Off</b>. Models pick it up the next time they start
@@ -743,11 +892,14 @@ let GP=[];
 async function loadGpus(){const r=await api('gpus');if(r.error){$('#gl').textContent=r.error;return}GP=r.gpus;
  $('#gl').innerHTML='<table><tr><th>GPU</th><th>Where</th><th>Memory used</th><th>Status</th><th>Mode</th></tr>'+GP.map((g,i)=>{
   const mem=g.total?`<span class="bar"><i style="width:${Math.round(100*g.used/g.total)}%"></i></span> ${(g.used/1024).toFixed(1)} / ${(g.total/1024).toFixed(1)} GB`:'';
-  const st=!g.online?'<span class="tag bad">offline</span>':g.busy?'<span class="tag mid">online, busy</span>':'<span class="tag ok">online</span>';
-  return `<tr><td><input id="gn_${i}" value="${esc(g.name)}" size="20" title="${esc(g.model)}"> <button class="s" onclick="gname(${i})" title="Save name">&#9998; Save</button>${g.model&&g.model!=g.name?'<br><small>'+esc(g.model)+'</small>':''}</td><td>${esc(g.where)}</td><td>${mem}</td><td>${st}</td><td class="seg">${['use','standby','off'].map(m=>`<button class="${g.mode==m?'on':''}" onclick="setg(${i},'${m}')">${m[0].toUpperCase()+m.slice(1)}</button>`).join('')}</td></tr>`}).join('')+'</table>';
+  const st=!g.online?'<span class="tag bad">offline</span>':g.busy?'<span class="tag ok">in use by a model</span>':g.slow?'<span class="tag mid">online, slow to answer</span>':'<span class="tag ok">online</span>';
+  return `<tr><td><input id="gn_${i}" value="${esc(g.name)}" size="20" title="${esc(g.model)}"> <button class="s" onclick="gname(${i})" title="Save name">&#9998; Save</button>${g.model&&g.model!=g.name?'<br><small>'+esc(g.model)+'</small>':''}</td><td>${esc(g.where)}</td><td>${mem}</td><td>${st}${!g.online&&g.key!='server'?' <button class="s" onclick="gforget('+i+')">Forget</button>':''}${g.auto_off?'<br><span class="tag mid">off automatically: the PC is using it</span>':''}${g.key=='server'?'':g.reporter===false?'<br><small class="m">no GPU-use report from this PC</small>':g.pc_pct!=null?'<br><small class="m">PC\'s own use: '+esc(g.pc_pct)+'%'+(g.pc_top?' ('+esc(g.pc_top)+')':'')+'</small>':''}</td><td class="seg">${['use','standby','off'].map(m=>`<button class="${g.mode==m?'on':''}" onclick="setg(${i},'${m}')">${m[0].toUpperCase()+m.slice(1)}</button>`).join('')}</td></tr>`}).join('')+'</table>';
+ if(r.guard&&![$('#gap'),$('#gab')].includes(document.activeElement)){$('#gap').value=r.guard.pct;$('#gab').value=r.guard.back}
  $('#run').innerHTML=r.running.length?r.running.map(x=>`<span class="tag ok">${esc(x.model)} - ${esc(x.state)}</span> `).join(''):'<span class="m">No model loaded right now.</span>'}
+function gforget(i){if(confirm('Forget '+GP[i].name+' ('+GP[i].where+')? Its name and settings are removed. Use this for a PC that is gone or got a new address.'))act('gpu_forget',{key:GP[i].key},loadGpus)}
 function gname(i){act('gpu_name',{key:GP[i].key,name:$('#gn_'+i).value},loadGpus)}
 function setg(i,m){act('gpu_policy',{key:GP[i].key,value:m},()=>setTimeout(loadGpus,1500))}
+$('#gas').onclick=()=>act('gpu_guard',{pct:$('#gap').value,back:$('#gab').value},loadGpus);
 $('#unl').onclick=()=>act('unload',{},()=>setTimeout(loadGpus,1500));
 async function badge(){}
 /* ---------- settings ---------- */
@@ -989,6 +1141,8 @@ class H(BaseHTTPRequestHandler):
                 out = "Checking Hugging Face... the list updates in about a minute."
             elif p == "gpu_policy": out = set_policy(b.get("key", ""), b.get("value", ""))
             elif p == "gpu_name": out = set_gpu_name(b.get("key", ""), b.get("name", ""))
+            elif p == "gpu_guard": out = set_guard_settings(b.get("pct", 40), b.get("back", 5))
+            elif p == "gpu_forget": out = forget_gpu(str(b.get("key", "")))
             elif p == "rename": out = rename_model(b.get("name", ""), b.get("new", ""))
             elif p == "unload":
                 get(f"{SWAP}/unload", 30); out = "All models stopped."
@@ -1031,4 +1185,5 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--port", type=int, default=8091); ap.add_argument("--host", default="0.0.0.0")
     a = ap.parse_args()
+    threading.Thread(target=guard_loop, daemon=True, name="gpu-auto-off").start()
     ThreadingHTTPServer((a.host, a.port), H).serve_forever()
