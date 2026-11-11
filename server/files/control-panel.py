@@ -244,6 +244,7 @@ GUARD = "/opt/ai/gpu-guard.json"
 STATUS_PORT = 50053
 _guard = {"hits": {}}
 _guard_lock = threading.Lock()
+_pol_lock = threading.Lock()   # every read-change-write of POL (panel clicks and auto-off), so no change is lost
 
 
 def _guard_note(text):
@@ -266,8 +267,9 @@ def set_guard_settings(pct, back):
     try: pct, back = int(pct), int(back)
     except (TypeError, ValueError): raise ValueError("Use whole numbers.")
     if not (0 <= pct <= 100 and 1 <= back <= 120): raise ValueError("Use 0-100 % (0 = never) and 1-120 minutes.")
-    pol = jload(POL, {}); pol["auto_off_pct"] = pct; pol["auto_back_min"] = back
-    write_file(POL, json.dumps(pol, indent=1), 0o644)
+    with _pol_lock:
+        pol = jload(POL, {}); pol["auto_off_pct"] = pct; pol["auto_back_min"] = back
+        write_file(POL, json.dumps(pol, indent=1), 0o644)
     if pct == 0: return "Saved. GPU PCs are never switched off automatically."
     return f"Saved. A GPU PC switches to Off while its own programs use its GPU more than {pct}%, and goes back after {back} min below that."
 
@@ -286,9 +288,15 @@ def stop_models_on(w):
     return n
 
 
-def _guard_set_mode(w, mode):
-    pol = jload(POL, {}); pol.setdefault("workers", {})[w] = mode
-    write_file(POL, json.dumps(pol, indent=1), 0o644)
+def _guard_set_mode(w, mode, expected):
+    """Set GPU PC w to mode, but only if its mode is still `expected` (what auto-off saw at the start of the check).
+    If someone changed it in the panel meanwhile, their choice wins and nothing is written."""
+    with _pol_lock:
+        pol = jload(POL, {})
+        if pol.get("workers", {}).get(w, "use") != expected: return False
+        pol.setdefault("workers", {})[w] = mode
+        write_file(POL, json.dumps(pol, indent=1), 0o644)
+    return True
 
 
 def guard_tick():
@@ -301,8 +309,9 @@ def forget_gpu(key):
     if key in workers_in_use() or _gpu_cache["workers"].get(key, {}).get("online"):
         raise ValueError("This GPU PC is online. Only offline GPU PCs can be forgotten.")
     with _guard_lock:
-        pol = jload(POL, {}); pol.get("workers", {}).pop(key, None); pol.get("names", {}).pop(key, None)
-        write_file(POL, json.dumps(pol, indent=1), 0o644)
+        with _pol_lock:
+            pol = jload(POL, {}); pol.get("workers", {}).pop(key, None); pol.get("names", {}).pop(key, None)
+            write_file(POL, json.dumps(pol, indent=1), 0o644)
         st = jload(GUARD, {}); st.get("workers", {}).pop(key, None)
         write_file(GUARD, json.dumps(st, indent=1), 0o644)
         _gpu_cache["workers"].pop(key, None); _guard["hits"].pop(key, None)
@@ -332,7 +341,8 @@ def _guard_tick():
                 e["low_since"] = e.get("low_since") or now
                 if thr == 0 or now - e["low_since"] >= back * 60:
                     prev = e.get("prev", "use")
-                    _guard_set_mode(w, prev); e.update(auto_off=False, low_since=None)
+                    if not _guard_set_mode(w, prev, "off"): continue   # changed by hand meanwhile: the next check sees it
+                    e.update(auto_off=False, low_since=None)
                     _guard_note(f"✅ {name}: auto-off was turned off, so the AI may use this GPU again ({prev})." if thr == 0 else
                                 f"✅ {name}: its PC is free again ({pct}%), so the AI may use this GPU again ({prev}).")
             else:
@@ -341,7 +351,8 @@ def _guard_tick():
             _guard["hits"][w] = _guard["hits"].get(w, 0) + 1
             if _guard["hits"][w] >= 2:                             # two checks in a row (about 10 s), not a short spike
                 _guard["hits"][w] = 0
-                _guard_set_mode(w, "off"); e.update(auto_off=True, prev=mode, since=now, low_since=None)
+                if not _guard_set_mode(w, "off", mode): continue    # changed by hand meanwhile: keep that choice
+                e.update(auto_off=True, prev=mode, since=now, low_since=None)
                 n = stop_models_on(w)
                 top = f", {e['top']}" if e.get("top") else ""
                 stopped = f" ({n} model(s) stopped; they restart without it)" if n else ""
@@ -392,10 +403,11 @@ def gpus():
 def set_gpu_name(key, name):
     if key != "server" and not RE_WORKER.match(key): raise ValueError("bad gpu")
     name = re.sub(r"[^\w .()+-]", "", str(name)).strip()[:40]
-    pol = jload(POL, {})
-    if name: pol.setdefault("names", {})[key] = name
-    else: pol.get("names", {}).pop(key, None)
-    write_file(POL, json.dumps(pol, indent=1), 0o644)
+    with _pol_lock:
+        pol = jload(POL, {})
+        if name: pol.setdefault("names", {})[key] = name
+        else: pol.get("names", {}).pop(key, None)
+        write_file(POL, json.dumps(pol, indent=1), 0o644)
     return "Name saved."
 
 
@@ -428,11 +440,12 @@ def rename_model(old, new):
 
 def set_policy(key, value):
     if value not in ("use", "standby", "off"): raise ValueError("bad mode")
-    pol = jload(POL, {})
-    if key == "server": pol["server"] = value
-    elif RE_WORKER.match(key): pol.setdefault("workers", {})[key] = value
-    else: raise ValueError("bad gpu")
-    write_file(POL, json.dumps(pol, indent=1), 0o644)
+    if key != "server" and not RE_WORKER.match(key): raise ValueError("bad gpu")
+    with _pol_lock:
+        pol = jload(POL, {})
+        if key == "server": pol["server"] = value
+        else: pol.setdefault("workers", {})[key] = value
+        write_file(POL, json.dumps(pol, indent=1), 0o644)
     try: get(f"{SWAP}/unload", 30)
     except Exception: pass
     return "Saved. Running models were stopped; the next chat starts them with the new GPU choice."
