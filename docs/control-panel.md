@@ -30,7 +30,7 @@ What you'll see, from top to bottom:
 - **Downloads.** A progress bar for each download. When it says *ready*, refresh Open WebUI and the model is in the list.
 - **Installed models.** **Rename** changes the name shown in Open WebUI (old chats keep the old name). **Remove** deletes the model file.
 
-Models don't use the GPUs until someone sends a message. They load then, and unload again after a while of no use. More in [Models](models.md).
+Models don't use the GPUs until someone sends a message. They load then, and unload again after they've been idle for a while. More in [Models](models.md).
 
 ## GPUs
 
@@ -52,7 +52,7 @@ Models don't use the GPUs until someone sends a message. They load then, and unl
   - *PC's own use: 12% (game.exe)*: the PC's own GPU use. The AI's use isn't counted.
   - *off automatically: the PC is using it*: auto-off has switched it off for now.
   - *no GPU-use report from this PC*: auto-off can't work for this PC yet. Run the installer on it again (Add a PC tab).
-  - If you change a GPU's mode yourself, your choice wins: auto-off won't switch a GPU back on that you turned Off.
+  - If you change a GPU's mode yourself, your choice wins: auto-off won't switch back on a GPU that you turned Off.
   - Setting 0% turns auto-off off.
 - **Forget.** Removes an offline GPU from the list, including its name and settings. Use it for a PC you don't have anymore, or one that got a new IP address and now shows up twice. See [IP addresses](ip-addresses.md).
 - **Running now.** The models loaded at the moment. **Stop all running models** frees all GPU memory straight away.
@@ -101,7 +101,7 @@ RAID is not a backup. More in [Storage](storage.md).
 How to lend another PC's graphics card to the server.
 
 - **Windows:** open the `add-this-pc.bat` link on that PC, save it, double-click it and click **Yes**. Wait for **WORKER-OK**. It installs two small background tasks: the GPU worker and the GPU-use report for auto-off.
-- **Linux:** copy the command shown and paste it into a Terminal on that PC.
+- **Linux:** copy the command shown and paste it into a terminal on that PC.
 - **GPU PCs the server can see.** New PCs show up here within a minute. **Look for new PCs now** checks again. Then go to the GPUs tab to name the new GPU and choose Use, Standby or Off.
 - **PC on a different network?** Only needed if a PC is on another subnet: type its address here.
 

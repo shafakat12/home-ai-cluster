@@ -9,7 +9,7 @@ Models are big (3–30 GB each), so you choose where they live. Your options:
 | **One whole drive** | **yes** | a spare HDD or SSD just for the AI |
 | **RAID**: several drives combined into one | **yes** | more space, more speed, or survives a dead drive |
 
-The **installer asks** the first time it runs. If the server has only one disk it says so and skips the question. You can change your choice **any time later**:
+The **installer asks** the first time it runs. If the server has only one disk, it says so and skips the question. You can change your choice **any time later**:
 
 * in the control panel: **Storage** tab (`http://SERVER-IP:8091`), or
 * on the server: `sudo ai-storage`
@@ -61,7 +61,7 @@ The drive list shows what each drive is:
 
 * Drives of different sizes work, but every drive is only used up to the size of the **smallest** one.
 * Mixing HDD and SSD works, but the RAID runs at the speed of the slowest drive.
-* RAID 1/5/10 build their safety copy in the background after creating (hours for big drives). You can use them right away; they are a bit slower until that finishes. Progress is shown in the control panel's **Health** tab.
+* RAID 1/5/10 build their safety copy in the background after they are created (hours for big drives). You can use them right away; they are a bit slower until that finishes. Progress is shown in the control panel's **Health** tab.
 * **RAID is not a backup.** A deleted or damaged file is gone from every drive at once. The nightly backups cover settings and chats. Models can always be downloaded again.
 * It uses standard Linux software RAID (`mdadm`). No special hardware or BIOS RAID setting is needed. Leave BIOS RAID **off**.
 

@@ -21,7 +21,7 @@ This page is about what runs where. For what each tab and button of the control 
 
 1. Open WebUI sends it to llama-swap (`127.0.0.1:8080`) with the chosen model name.
 2. If that model isn't running, llama-swap starts it through `/opt/ai/bin/llama-run.sh`:
-   * `find-workers.sh` scans the home network for GPU PCs (port 50052) and adds `/opt/ai/workers.txt`.
+   * `find-workers.sh` scans the home network for GPU PCs (port 50052) and adds any PCs listed in `/opt/ai/workers.txt`.
    * The GPU choices from the control panel (`/opt/ai/gpu-policy.json`) decide which GPUs may be used.
    * `llama-server` loads the model file and spreads its layers over the allowed GPUs (`--rpc`). The model data is streamed to the GPU PCs over the network, so nothing is stored on them.
 3. The answer streams back. After the model's idle time (`ttl`) it is stopped and the GPUs are free again.
@@ -41,7 +41,7 @@ Groups in `llama-swap.yaml` decide which models may run at the same time. Small 
 * **Use**: every model may use this GPU.
 * **Standby**: only big pooled models use it, or models with nowhere else to go.
 * **Off**: never used. Good for a gaming PC while someone is playing.
-* **Auto-off**: the control panel checks every GPU PC every 5 seconds. Above 40% use by the PC's own programs it sets that GPU to Off and stops the models using it; 5 minutes after the PC is quiet it restores the old mode. State: `/opt/ai/gpu-guard.json`, settings in `/opt/ai/gpu-policy.json` (`auto_off_pct`, `auto_back_min`).
+* **Auto-off**: the control panel checks every GPU PC every 5 seconds. Above 40% use by the PC's own programs it sets that GPU to Off and stops the models using it; 5 minutes after the PC is quiet, it restores the old mode. State: `/opt/ai/gpu-guard.json`, settings in `/opt/ai/gpu-policy.json` (`auto_off_pct`, `auto_back_min`).
 * **In use by a model**: a GPU PC serves one model at a time and doesn't answer other connections meanwhile. The panel sees which GPU PCs the running models use and shows them as in use instead of offline.
 
 ## Files on the server

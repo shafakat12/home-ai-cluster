@@ -1,7 +1,7 @@
 # IP addresses: reserve them, and what happens when one changes
 
 Your router gives every device an address (DHCP). Most of the time a device keeps it, but after a router restart,
-a long time switched off, or a new network card it can get a different one. Home AI Cluster finds and trusts devices
+a long time switched off or a new network card, it can get a different one. Home AI Cluster finds and trusts devices
 **by their address**, so give these devices a fixed address:
 
 * the **AI server** (most important),
@@ -33,8 +33,8 @@ devices may end up with the same address.
 
 **Fix (easiest first)**
 
-1. In the router, reserve the server's **old** address for it again and restart the server. Everything works again,
-   nothing else to do.
+1. In the router, reserve the server's **old** address for it again and restart the server. Everything works again;
+   there's nothing else to do.
 2. Or keep the new address:
    * on the server: `cd home-ai-cluster && sudo bash install.sh`. It detects the new address and rebuilds the installers.
      (If you set `SERVER_IP` in `config.env`, change it there first.)
