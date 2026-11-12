@@ -205,8 +205,7 @@ worker/windows, worker/linux  GPU-PC installers (served by the server on port 80
 image-generation/           ComfyUI installer for a Windows NVIDIA PC + Open WebUI workflow
 clients/windows/            VS Code / Claude Code setup for a Windows PC
 docs/                       documentation
-tools/publish-to-github.ps1 publish your copy to GitHub (also used by Claude Code, see CLAUDE.md)
-CLAUDE.md                   notes for AI coding assistants working on this repository
+tools/publish-to-github.ps1 publish your copy to GitHub
 ```
 
 ## Built with
