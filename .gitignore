@@ -3,3 +3,4 @@ config.env
 __pycache__/
 *.pyc
 CLAUDE-CODE-*.md
+CLAUDE.md
