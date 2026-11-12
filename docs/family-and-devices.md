@@ -19,7 +19,7 @@ The installer presets web search for new installs. If it is off: **Admin Panel â
 
 ## The control panel from any device
 
-`http://SERVER-IP:8091` works from every device on the home network after logging in with the admin password. Settings shows which devices are logged in and can log them all out. Five wrong passwords lock that device out for 10 minutes.
+`http://SERVER-IP:8091` works from every device on the home network once you log in with the admin password. Settings shows which devices are logged in and can log them all out. Five wrong passwords lock that device out for 10 minutes.
 
 ## Coding tools and direct API access
 

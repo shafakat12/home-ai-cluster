@@ -4,7 +4,7 @@ Image generation runs [ComfyUI](https://github.com/comfyanonymous/ComfyUI) with 
 
 ## 1. Install ComfyUI on the GPU PC
 
-Copy `image-generation/windows/install-comfyui.ps1` to that PC, open PowerShell **as Administrator** in that folder:
+Copy `image-generation/windows/install-comfyui.ps1` to that PC, then open PowerShell **as Administrator** in that folder and run:
 
 ```powershell
 Unblock-File .\install-comfyui.ps1                     # files downloaded from GitHub are blocked by Windows
@@ -35,4 +35,4 @@ Family members also need **Admin Panel → Users → Groups → Default permissi
 ## Notes
 
 * The same GPU can also be a text-model worker. ComfyUI frees its memory after each picture (`--disable-smart-memory`). If a big text model is using that GPU, images are slower or fail; press "Free GPU for images" first.
-* Speed depends on GPU **and** system RAM: on a 2080 Ti with 16 GB RAM one image takes about 2 minutes, mostly loading time. 32 GB RAM is much faster.
+* Speed depends on GPU **and** system RAM: on a 2080 Ti with 16 GB RAM one image takes about 2 minutes, mostly loading time. With 32 GB RAM, it's much faster.

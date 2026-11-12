@@ -6,15 +6,15 @@ I have a small Ubuntu server with a 6 GB GTX 1660 Super and a gaming PC with an 
 
 Everything runs on your own hardware: no cloud, no subscription, and the chats stay at home.
 
-> **Status: beta.** It runs on my own server. A clean install on a fresh machine, AMD/Intel GPUs and RAID creation on real drives are not tested yet. If something breaks on your hardware, please open an issue.
+> **Status: beta.** It runs on my own server. A clean install on a fresh machine, AMD/Intel GPUs and RAID creation on real drives haven't been tested yet. If something breaks on your hardware, please open an issue.
 
 ## What it does
 
 - **Family chat:** [Open WebUI](https://github.com/open-webui/open-webui) on port 3000, one account per person, works on phones.
 - **GPU pooling:** big models are split across the server's GPU and the GPUs of other PCs ([llama.cpp](https://github.com/ggml-org/llama.cpp) RPC). Adding a PC is one `.bat` file on Windows or one command on Linux.
-- **GPU control:** each GPU can be set to Use, Standby (only big models) or Off. **Auto-off:** when a GPU PC's own programs (a game, a video...) use more than 40% of its GPU, the server stops using that GPU, and takes it back 5 minutes after the PC is quiet again. A GPU PC that is busy with a model shows as "in use".
+- **GPU control:** each GPU can be set to Use, Standby (only big models) or Off. **Auto-off:** when a GPU PC's own programs (a game, a video...) use more than 40% of its GPU, the server stops using that GPU, then takes it back 5 minutes after the PC is quiet again. A GPU PC that is busy with a model shows as "in use".
 - **Models on demand:** [llama-swap](https://github.com/mostlygeek/llama-swap) loads a model when someone asks for it and unloads it later. Two extra models: `auto` picks a model for each message, `team` lets two models answer and a third combine them.
-- **Control panel (port 8091):** add models from Hugging Face, live server and drive health, drives and RAID for storage, adding PCs, Telegram alerts.
+- **Control panel (port 8091):** add models from Hugging Face, see live server and drive health, set up drives and RAID for storage, add PCs, and set up Telegram alerts.
 - **Extras:** private web search with [SearXNG](https://github.com/searxng/searxng), optional image generation with [ComfyUI](https://github.com/comfyanonymous/ComfyUI), and an OpenAI/Anthropic-compatible API for VS Code and scripts.
 - **Backups and alerts:** nightly backup of chats and settings, and a Telegram message if a disk, a RAID or a service has a problem.
 
@@ -68,7 +68,7 @@ flowchart LR
 
 * The **server** stores the models and runs everything. The model is split layer by layer across all allowed GPUs.
 * **GPU PCs** run a tiny worker (`rpc-server`) that only lends their GPU. Their own files are never touched, and only the server may connect to them.
-* Models start when someone sends a message and stop after a while of no use, so GPU PCs are free for other work most of the time.
+* Models start when someone sends a message and stop after they've been idle for a while, so GPU PCs are free for other work most of the time.
 
 ## Requirements
 
@@ -147,7 +147,7 @@ for i in 1 2; do curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-T
 
 ## Known issues and what's next
 
-- Only tested on my own hardware (GTX 1660 Super server + RTX 2080 Ti Windows PC, wired 2.5 GbE). AMD and Intel GPUs (Vulkan) should work but I haven't tried them.
+- Only tested on my own hardware (GTX 1660 Super server + RTX 2080 Ti Windows PC, wired 2.5 GbE). AMD and Intel GPUs (Vulkan) should work, but I haven't tried them yet.
 - A full install on a fresh Ubuntu machine hasn't been tested end to end yet.
 - Creating a RAID has only been tested as a dry run, not on real drives.
 - `team` is slow (about 2.5 minutes per answer) because three models run one after another.
@@ -173,7 +173,7 @@ for i in 1 2; do curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-T
 | Setting | Default | Meaning |
 |---|---|---|
 | `SERVER_IP` | detected | the server's address |
-| `LAN_CIDR` | detected | your home network, e.g. `192.168.1.0/24` (only it may connect) |
+| `LAN_CIDR` | detected | your home network, e.g. `192.168.1.0/24` (only devices on it may connect) |
 | `ADMIN_PC_IP` | empty | your main PC: may use the API directly and create the panel password without the code |
 | `MODEL_PRESET` | `auto` | `auto`, `small`, `standard`, `full`, `none` |
 | `STORAGE` | empty (= ask) | where models go: `folder:/path`, `drive:/dev/sdb`, `raid1:/dev/sdb,/dev/sdc` (raid0/1/5/10). See [Storage](docs/storage.md) |
