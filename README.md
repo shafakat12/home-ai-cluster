@@ -1,6 +1,6 @@
 # Home AI Cluster
 
-My home AI setup, cleaned up so other people can install it on their own network.
+This is the AI setup I run at home, cleaned up so you can install it on your own network too.
 
 I have a small Ubuntu server with a 6 GB GTX 1660 Super and a gaming PC with an 11 GB RTX 2080 Ti. Neither card can run a 20B model on its own, but together they can. So this project splits one model across the GPUs of several PCs over the home network (llama.cpp RPC), and puts a normal chat website in front of it so my family can use it from their phones and laptops.
 
