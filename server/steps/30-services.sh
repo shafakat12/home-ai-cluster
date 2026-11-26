@@ -5,7 +5,7 @@ F=$REPO/server/files
 
 info "helper scripts..."
 install -o "$ADMIN" -g "$ADMIN" -m 755 "$F/find-workers.sh" "$F/llama-run.sh" "$F/download-models.sh" "$F/router.py" \
-        "$F/add-model.sh" "$F/make-config.py" /opt/ai/bin/
+        "$F/add-model.sh" "$F/model-download.sh" "$F/make-config.py" /opt/ai/bin/
 [ -f /opt/ai/workers.txt ] || printf '# GPU worker PCs on OTHER networks only (ip[:port] per line). PCs on this network are found automatically.\n' > /opt/ai/workers.txt
 [ -f /opt/ai/gpu-policy.json ] || echo '{"server":"use","workers":{}}' > /opt/ai/gpu-policy.json
 chown "$ADMIN:$ADMIN" /opt/ai/workers.txt /opt/ai/gpu-policy.json; chmod 644 /opt/ai/gpu-policy.json
@@ -21,7 +21,12 @@ conf_set MODEL_PRESET "$P"
 V=$(server_vram); V=${V:-0}
 SOLO=$(awk -v v="$V" 'BEGIN{printf "%.1f", (v>0? v*0.75/1024 : 2)}')
 conf_set SOLO_GB "$SOLO"; grep -q '^POOL_GB=' /opt/ai/ai.conf || conf_set POOL_GB "$(awk -v s="$SOLO" 'BEGIN{printf "%.0f", s+9}')"
-as_admin python3 /opt/ai/bin/make-config.py "$P" "$MODELS_DIR"
+# starter models live on the system disk (CORE_DIR, never moved by ai-storage); later downloads go to MODELS_DIR.
+# Installs from before CORE_DIR keep their starter models where they are (no second download).
+CORE=$(aiconf CORE_DIR)
+if [ -z "$CORE" ]; then if [ -f /opt/ai/llama-swap.yaml ]; then CORE=$MODELS_DIR; else CORE=/opt/ai/models-core; fi; fi
+install -d -m 755 -o "$ADMIN" -g "$ADMIN" "$CORE"; conf_set CORE_DIR "$CORE"
+as_admin python3 /opt/ai/bin/make-config.py "$P" "$CORE"
 
 info "llama-swap (model switcher, port 8080)..."
 if [ ! -x /opt/ai/bin/llama-swap ]; then
@@ -106,7 +111,11 @@ fi
 info "firewall..."
 ufw allow from "$LAN_CIDR" to any port 3000 proto tcp comment 'Open WebUI (home network)' >/dev/null
 ufw allow from "$LAN_CIDR" to any port 8090 proto tcp comment 'AI worker kit (home network)' >/dev/null
-[ -n "${ADMIN_PC_IP:-}" ] && ufw allow from "$ADMIN_PC_IP" to any port 8080 proto tcp comment 'AI API (admin PC)' >/dev/null
+# The AI API (8080) is opened per PC by the control panel's PC registry (step 60 seeds it from ADMIN_PC_IP, then
+# pc-access-sync applies it). If the control panel is not installed, open it here for the admin PC as a fallback.
+if [ -n "${ADMIN_PC_IP:-}" ] && [ "${INSTALL_CONTROL_PANEL:-yes}" != yes ]; then
+  ufw allow from "$ADMIN_PC_IP" to any port 8080 proto tcp comment 'AI API (admin PC)' >/dev/null
+fi
 
 systemctl daemon-reload
 systemctl enable --now ai-worker-kit llama-swap >/dev/null 2>&1

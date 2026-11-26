@@ -1,0 +1,93 @@
+#!/usr/bin/python3 -I
+"""Root helper for the AI Control Panel: keeps the firewall rules for extra PCs in step with the panel's
+PC registry (/opt/ai/pcs.json). It manages ONLY these rules and nothing else:
+  - the AI API            : 8080/tcp              (for PCs with "api": true)
+  - the image-model share : 111,2049,20048 tcp+udp (for PCs with "share": true)
+Every rule it creates carries the comment tag "home-ai-pc:<ip>", and it only ever deletes rules it created
+(tracked in its own state file). It never touches the 22/3000/8090/8091 LAN rules. Home-network IPv4 only.
+
+Registry /opt/ai/pcs.json (written by the panel):  {"192.168.0.50": {"api": true, "share": false, "name": "...", "mac": "..."}}
+State    /var/lib/home-ai/net/pc-access.applied :  {"192.168.0.50": ["api"], ...}   (what this tool has applied)
+"""
+import ipaddress, json, os, subprocess, sys
+
+REGISTRY = "/opt/ai/pcs.json"
+STATE = "/var/lib/home-ai/net/pc-access.applied"
+NFS_PORTS = ("111", "2049", "20048")
+TAG = "home-ai-pc:"
+
+
+def ufw(*a):
+    return subprocess.run(["ufw", *a], capture_output=True, text=True)
+
+
+def rules_for(kind, ip):
+    """The exact ufw rule argument lists for one kind of access from one IP (so delete matches add exactly)."""
+    tag = f"{TAG}{ip}"
+    if kind == "api":
+        return [["from", ip, "to", "any", "port", "8080", "proto", "tcp", "comment", tag]]
+    if kind == "share":
+        out = []
+        for p in NFS_PORTS:
+            out.append(["from", ip, "to", "any", "port", p, "proto", "tcp", "comment", tag])
+            out.append(["from", ip, "to", "any", "port", p, "proto", "udp", "comment", tag])
+        return out
+    return []
+
+
+def valid_ip(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+        return a.version == 4 and a.is_private
+    except ValueError:
+        return False
+
+
+def load(path, default):
+    try:
+        with open(path) as f: return json.load(f)
+    except Exception:
+        return default
+
+
+def desired():
+    """{ip: set(kinds)} from the registry, validated."""
+    out = {}
+    for ip, cfg in (load(REGISTRY, {}) or {}).items():
+        if not valid_ip(ip) or not isinstance(cfg, dict): continue
+        kinds = {k for k in ("api", "share") if cfg.get(k)}
+        if kinds: out[ip] = kinds
+    return out
+
+
+def main():
+    if os.geteuid() != 0:
+        print("pc-access-sync must run as root (through its sudo rule)"); sys.exit(2)
+    want = desired()
+    have = {ip: set(v) for ip, v in (load(STATE, {}) or {}).items() if valid_ip(ip)}
+
+    changed = []
+    # add rules that should exist but don't
+    for ip, kinds in want.items():
+        for kind in kinds - have.get(ip, set()):
+            for args in rules_for(kind, ip):
+                ufw("allow", *args)
+            changed.append(f"+{kind} {ip}")
+    # remove rules we previously applied that are no longer wanted (only our own, by exact match)
+    for ip, kinds in have.items():
+        for kind in kinds - want.get(ip, set()):
+            for args in rules_for(kind, ip):
+                ufw("delete", "allow", *args)
+            changed.append(f"-{kind} {ip}")
+
+    # the registry is now the applied state
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f: json.dump({ip: sorted(kinds) for ip, kinds in want.items()}, f, indent=1)
+    os.replace(tmp, STATE)
+
+    pcs = ", ".join(f"{ip}({'+'.join(sorted(k))})" for ip, k in sorted(want.items())) or "none"
+    print(f"PC firewall rules in sync. Allowed PCs: {pcs}." + (f" Changes: {', '.join(changed)}." if changed else " No change."))
+
+
+if __name__ == "__main__":
+    main()
