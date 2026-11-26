@@ -6,7 +6,7 @@ LOGD=/opt/ai/logs; CFG=/opt/ai/llama-swap.yaml
 N=${1:?name}; [[ "$N" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || { echo "FAILED: bad name"; exit 1; }
 J=$LOGD/add-$N.job
 [ -f "$J" ] || { echo "FAILED: no download job for $N"; exit 1; }
-REPO=""; MAINF=""; MMF=""; MODE=pool; CTX=32768; MD=""; TOTAL=0
+REPO=""; MAINF=""; MMF=""; MODE=pool; CTX=32768; MD=""
 # shellcheck source=/dev/null
 . "$J"
 echo $$ > "$LOGD/add-$N.pid"

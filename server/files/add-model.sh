@@ -2,6 +2,7 @@
 # add-model.sh <name> <hf-repo> <quant> <solo|pool> [context]   -> downloads a GGUF model and adds it to the menu
 # add-model.sh --remove <name>                                  -> removes it (and its files)
 # add-model.sh --list                                           -> shows installed models
+# add-model.sh --pause <name> / --resume <name>                 -> pause or continue a download
 set -euo pipefail
 CFG=/opt/ai/llama-swap.yaml; LOGD=/opt/ai/logs
 conf(){ grep -oP "^$1=\K.*" /opt/ai/ai.conf 2>/dev/null || true; }
@@ -9,6 +10,21 @@ MD=$(conf MODELS_DIR); MD=${MD:-/opt/ai/models}
 SOLO_GB=$(conf SOLO_GB); SOLO_GB=${SOLO_GB:-4.5}; POOL_GB=$(conf POOL_GB); POOL_GB=${POOL_GB:-13}
 if [ "${1:-}" = "--list" ]; then
   awk '/^[^ ]/{m=($0 ~ /^models:/)} m && /^  "[^"]+":/' "$CFG" | tr -d ' ":'; echo; ls -lh "$MD" | awk 'NR>1{print "  "$5"  "$9}'; exit 0
+fi
+if [ "${1:-}" = "--pause" ] || [ "${1:-}" = "--resume" ]; then
+  N=${2:?name}; [[ "$N" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || { echo "Bad name"; exit 1; }
+  PIDF=$LOGD/add-$N.pid; JOB=$LOGD/add-$N.job; LOG=$LOGD/add-$N.log
+  RUN=""; [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null && RUN=$(cat "$PIDF")
+  if [ "$1" = "--pause" ]; then
+    [ -n "$RUN" ] || { echo "$N is not downloading right now"; exit 1; }
+    kill -TERM -- "-$RUN" 2>/dev/null || kill -TERM "$RUN"; sleep 1; rm -f "$PIDF"
+    printf '\nPAUSED: %s (press Continue to carry on from where it stopped)\n' "$N" >> "$LOG"; echo "Paused $N"; exit 0
+  fi
+  [ -z "$RUN" ] || { echo "$N is already downloading"; exit 1; }
+  [ -f "$JOB" ] || { echo "Nothing to continue for $N (it finished or was never started)"; exit 1; }
+  printf '\nRESUMED: %s\n' "$N" >> "$LOG"
+  setsid nohup /opt/ai/bin/model-download.sh "$N" >> "$LOG" 2>&1 < /dev/null &
+  echo "Continuing $N from where it stopped"; exit 0
 fi
 if [ "${1:-}" = "--remove" ]; then
   N=${2:?name}
@@ -69,19 +85,11 @@ echo "Model file: ${MAIN#* }  ($SIZE GB)   vision: $([ -n "$MM" ] && echo yes ||
 awk -v s="$SIZE" -v l="$LIMIT" 'BEGIN{exit !(s>l)}' && echo "WARNING: $SIZE GB is big for '$MODE' mode (about $LIMIT GB fits). It will still run, but slower (part goes to system RAM)."
 FREE=$(df --output=avail -BG "$MD" | tail -1 | tr -dc 0-9); echo "Free disk: ${FREE} GB"
 
-LOG=$LOGD/add-$NAME.log
-setsid nohup bash -c "
-  set -e
-  echo 'Downloading $NAME ...'
-  curl -fL --retry 10 -C - -o '$MD/$NAME.gguf.part' 'https://huggingface.co/$REPO/resolve/main/${MAIN#* }?download=true'
-  mv '$MD/$NAME.gguf.part' '$MD/$NAME.gguf'
-  MMARG=''
-  if [ -n '$MM' ]; then
-    curl -fL --retry 10 -C - -o '$MD/$NAME-mmproj.gguf' 'https://huggingface.co/$REPO/resolve/main/${MM#* }?download=true'
-    MMARG='--mmproj $MD/$NAME-mmproj.gguf'
-  fi
-  printf '\n  \"%s\":\n    cmd: >\n      /opt/ai/bin/llama-run.sh %s \${PORT}\n      -m %s %s\n      -c %s --jinja\n    ttl: 1800\n' '$NAME' '$MODE' '$MD/$NAME.gguf' \"\$MMARG\" '$CTX' >> '$CFG'
-  echo 'READY: $NAME is now in the model list (refresh Open WebUI).'
-" > "$LOG" 2>&1 < /dev/null &
+LOG=$LOGD/add-$NAME.log; JOB=$LOGD/add-$NAME.job
+TOTAL=${MAIN%% *}; [ -z "$MM" ] || TOTAL=$(( TOTAL + ${MM%% *} ))
+# the job file lets the download pause, continue and show its progress (model-download.sh reads it)
+printf 'REPO=%q\nMAINF=%q\nMMF=%q\nMODE=%q\nCTX=%q\nMD=%q\nTOTAL=%q\n' "$REPO" "${MAIN#* }" "${MM#* }" "$MODE" "$CTX" "$MD" "$TOTAL" > "$JOB"
+echo "Downloading $NAME ..." > "$LOG"
+setsid nohup /opt/ai/bin/model-download.sh "$NAME" >> "$LOG" 2>&1 < /dev/null &
 echo "Download started in the background. The model appears in Open WebUI when finished."
 echo "Progress: control panel (Models tab), or on the server: tail -f $LOG"

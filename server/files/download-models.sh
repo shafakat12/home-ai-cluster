@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Downloads the starter model files listed in /opt/ai/download-list.txt (resumable, safe to re-run).
 # Line format: <huggingface-repo> <file-in-repo> <local-name>
-MD=$(grep -oP '^MODELS_DIR=\K.*' /opt/ai/ai.conf 2>/dev/null || echo /opt/ai/models)
+# starter models: CORE_DIR (system disk, never moved by ai-storage); installs from before keep them in MODELS_DIR
+MD=$(grep -oP '^CORE_DIR=\K.*' /opt/ai/ai.conf 2>/dev/null || grep -oP '^MODELS_DIR=\K.*' /opt/ai/ai.conf 2>/dev/null || echo /opt/ai/models)
 cd "$MD" || exit 1
 while read -r repo file out; do
   [ -z "$repo" ] && continue
