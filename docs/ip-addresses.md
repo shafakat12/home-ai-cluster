@@ -64,3 +64,7 @@ entry with its **Forget** button in the GPUs tab.
   it can no longer use the AI API directly (VS Code, scripts). Add its new address in Settings. Logging in to the
   control panel with your password works from any address.
 * **Phones, tablets and family PCs** only open the chat website. Their own addresses don't matter.
+
+---
+
+Home AI Cluster · Made by [Shafakat Sayeedi](https://shafakat12.github.io/shafakat/)

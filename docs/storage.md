@@ -115,3 +115,7 @@ Check the drive names carefully: `sgdisk -R` overwrites the partition table of t
 ## Removing it
 
 `sudo bash uninstall.sh` leaves the storage mounted. To stop using a drive, first move the models back (`sudo ai-storage folder /opt/ai/models`). Then delete its `/mnt/ai-storage` line from `/etc/fstab` and, for a RAID, run `sudo mdadm --stop /dev/md/ai-storage` and delete its `ARRAY` line from `/etc/mdadm/mdadm.conf`.
+
+---
+
+Home AI Cluster · Made by [Shafakat Sayeedi](https://shafakat12.github.io/shafakat/)

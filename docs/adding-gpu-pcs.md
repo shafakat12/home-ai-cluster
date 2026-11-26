@@ -59,8 +59,23 @@ GPU PCs added before this feature need their installer run once more (same steps
 * Temporarily: set it to **Off** in the GPUs tab, or just turn the PC off. Models then use the remaining GPUs.
 * For good: Windows: delete the tasks **AI GPU Worker** and **AI GPU Status** in Task Scheduler, then the folder `C:\ai-worker`. Linux: `sudo systemctl disable --now ai-gpu-worker ai-gpu-status`.
 
+## Add another PC later
+
+You can add a PC any time - the server doesn't need reinstalling.
+
+* **A GPU PC** (lends its graphics card): run the installer on it as above (Windows `add-this-pc.bat`, or the Linux command from the **Add a PC** tab). It appears within a minute; name it and set Use / Standby / Off in the GPUs tab.
+* **A PC that only needs the AI API** (VS Code, Claude Code, a script - no GPU to lend): open the **Add a PC** tab, type the PC's address and tick **AI API**. The server opens port 8080 to that one address. Nothing else on your network can reach the API.
+* **A PC that mounts the image folder** (NFS, used when ComfyUI runs on a GPU PC): tick **Image share** for it instead.
+* **Keep its address stable:** press **Reserve IP** next to the PC (needs a supported router set up in Settings → Router), or reserve it in your router yourself. See [IP addresses](ip-addresses.md).
+
+Remove a PC - and its firewall rules - with **Remove** in the same table.
+
 ## Tips
 
 * A wired connection matters: while a model loads, its data travels over the network to the GPU PCs. 2.5 Gbit loads a 12 GB model in under a minute; Wi-Fi can take ten times longer.
 * Gaming on a GPU PC while a pooled model is loaded shares that GPU's memory. Set it to **Off** or **Standby** while playing.
 * After updating the server (new llama.cpp version), run the PC installer again so the versions match.
+
+---
+
+Home AI Cluster · Made by [Shafakat Sayeedi](https://shafakat12.github.io/shafakat/)

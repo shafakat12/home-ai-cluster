@@ -36,3 +36,7 @@ Then point the tool at the server:
 | Browser AI extensions (e.g. Page Assist) | OpenAI-compatible, `http://SERVER-IP:8080/v1` |
 
 On Windows (PowerShell: `Unblock-File .\setup-vscode.ps1; Set-ExecutionPolicy -Scope Process Bypass`), `clients/windows/setup-vscode.ps1 -Server SERVER-IP` creates a `claude-local` command, installs Cline and adds a desktop shortcut to the chat.
+
+---
+
+Home AI Cluster · Made by [Shafakat Sayeedi](https://shafakat12.github.io/shafakat/)

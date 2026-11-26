@@ -39,3 +39,7 @@ The choices live in `/opt/ai/router.json`. Renaming a model in the control panel
 * `aliases:` extra names for the same model
 
 Re-running the installer **keeps** this file. To rebuild it from a preset: `sudo -u $USER python3 /opt/ai/bin/make-config.py standard "$(grep -oP '^MODELS_DIR=\K.*' /opt/ai/ai.conf)" --force`.
+
+---
+
+Home AI Cluster · Made by [Shafakat Sayeedi](https://shafakat12.github.io/shafakat/)

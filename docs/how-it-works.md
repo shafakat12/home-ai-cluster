@@ -64,3 +64,7 @@ Groups in `llama-swap.yaml` decide which models may run at the same time. Small 
 ```
 
 All llama.cpp builds (server and GPU PCs) must be **the same version**. The installer publishes the version in `/opt/ai/worker-kit/llama-version.txt`, and the worker installers download exactly that version.
+
+---
+
+Home AI Cluster · Made by [Shafakat Sayeedi](https://shafakat12.github.io/shafakat/)

@@ -23,5 +23,17 @@ Start with the control panel's **Health** tab: it shows every service, whether e
 | A GPU switched to Off by itself | Auto-off: that PC's own programs used its GPU (see "PC's own use" in the GPUs tab). It comes back 5 minutes after the PC is quiet. Change or disable it in the GPUs tab. |
 | GPUs tab: "no GPU-use report from this PC" | Run the PC installer again (it adds the report). Windows: check the task **AI GPU Status**; Linux: `systemctl status ai-gpu-status`. |
 | Forgot the control-panel password | `rm /opt/ai/secrets/panel-pass` then `sudo bash install.sh 60-control-panel` (new setup code). |
+| Logs tab is empty / "last used" never shows | The panel user can't read the system logs. Run `sudo bash install.sh 60-control-panel` again (it adds the user to `systemd-journal`). |
+| A download is stuck or was stopped by a restart | Models tab > Downloads: **Continue** picks up where it stopped. **Cancel** deletes the partial file. |
+| Health tab: no **Restart** buttons | The sudo rules are from an older install. Run `sudo bash install.sh 60-control-panel` again. |
+| Settings > Power says "Not set up yet" or "Needs update" | The sudo rule for the power buttons is missing or from an older install (1-minute delay). Run `sudo bash install.sh 60-control-panel` again. |
+| A restart was started by mistake | You have 10 seconds: press **Cancel** in the red banner at the top of any tab, or on the server: `sudo systemctl stop home-ai-restart.timer home-ai-poweroff.timer`. |
+| Network and Approvals tabs are missing | The network watch is off. Set `INSTALL_NETWORK_WATCH=yes` in `config.env` and run `sudo bash install.sh 45-network`. |
+| Router **Test connection** fails | Check the type and address under Settings > Router. SSH types: is the server's public key on the router? HTTPS types: is the API or REST service turned on? *Certificate changed*: only if you replaced the router or its certificate, press **Trust the new certificate**. More in [Network watch](network.md). |
+| An approved block shows *failed* | The Approvals tab shows the reason under *failed*. The Logs tab (Network watch) has the details. Routers marked read-only in [Network watch](network.md) can't block; use AdGuard instead. |
 
-Logs: `/opt/ai/logs/install.log`, `/opt/ai/logs/model-download.log`, `journalctl -u llama-swap`, `journalctl -u open-webui`, `journalctl -u ai-control-panel`.
+Logs: the control panel's **Logs** tab, or `/opt/ai/logs/install.log`, `/opt/ai/logs/model-download.log`, `journalctl -u llama-swap`, `journalctl -u open-webui`, `journalctl -u ai-control-panel`, `journalctl -u ai-net-scan -u ai-net-exec`.
+
+---
+
+Home AI Cluster · Made by [Shafakat Sayeedi](https://shafakat12.github.io/shafakat/)
