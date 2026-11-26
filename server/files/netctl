@@ -1,0 +1,259 @@
+#!/usr/bin/python3 -I
+"""netctl - safe home-network tool for you, your scripts and AI agents (runs as root through one sudo rule).
+READ commands run immediately. CHANGES are only *requested*; they run after the owner clicks
+Approve in the control panel (Approvals tab) or taps Approve in the Telegram alert.
+Whoever asks for a change can never approve it.
+
+  netctl devices                      list devices on the network (from the scanner)
+  netctl scan                         scan the network now
+  netctl ports <ip>                   check open ports / services on one device
+  netctl alerts [n]                   recent security alerts
+  netctl adguard stats|clients|status|top
+  netctl adguard log [client-ip] [n]  recent DNS queries (optionally for one device)
+  netctl router clients|dhcp|firewall|status|updates|wifi   (what works depends on the router type)
+  netctl router caps|test|detect      what this router type can do / read-only test / guess the router type
+  netctl requests                     list change requests and their status
+  netctl request <action> '<json params>' '<reason>'
+      actions: adguard_block_domain {"domain"}  adguard_unblock_domain {"domain"}
+               adguard_block_client {"client"}  adguard_unblock_client {"client"}
+               router_block_mac {"mac","name"}  router_unblock_mac {"mac"}
+"""
+import json, os, re, sys, time, uuid, subprocess, base64, urllib.request, urllib.error, ipaddress
+import importlib.machinery, importlib.util
+
+# router drivers live next to this file (python -I: load by path, not from sys.path)
+_ld = importlib.machinery.SourceFileLoader("routers", os.path.join(os.path.dirname(os.path.realpath(__file__)), "routers.py"))
+_sp = importlib.util.spec_from_loader("routers", _ld); R = importlib.util.module_from_spec(_sp); _ld.exec_module(R)
+
+BASE = "/var/lib/home-ai/net"            # root-owned all the way up, so only root can change what root reads
+HERE = os.path.dirname(os.path.realpath(__file__))
+SECRETS = "/opt/ai/secrets"
+REQ = f"{BASE}/requests"
+
+
+def _admin():
+    try:
+        with open("/opt/ai/ai.conf") as f:
+            for l in f:
+                if l.startswith("ADMIN="): return l.strip().split("=", 1)[1]
+    except OSError: pass
+    return "root"
+
+
+OWNER = _admin()      # the installer's admin user: the control panel reads and decides requests as this user
+ACTIONS = {
+    "adguard_block_domain": ["domain"], "adguard_unblock_domain": ["domain"],
+    "adguard_block_client": ["client"], "adguard_unblock_client": ["client"],
+    "router_block_mac": ["mac"], "router_unblock_mac": ["mac"],
+}
+RE_DOMAIN = re.compile(r"^(?=.{1,253}$)([a-z0-9-]{1,63}\.)+[a-z]{2,63}$", re.I)
+RE_MAC = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", re.I)
+RE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,40}$", re.I)
+
+
+def die(msg, code=1):
+    print(msg); sys.exit(code)
+
+
+def env(name):
+    d = {}
+    p = f"{SECRETS}/{name}.env"
+    if os.path.exists(p):
+        for line in open(p):
+            if "=" in line and not line.strip().startswith("#"):
+                k, v = line.strip().split("=", 1); d[k] = v.strip().strip('"')
+    return d
+
+
+def jload(p, default):
+    try: return json.load(open(p))
+    except Exception: return default
+
+
+def run(args, timeout=120):
+    r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    return (r.stdout + r.stderr).strip()
+
+
+def check_ip(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+        if not a.is_private: die("Only devices on the home network can be checked.")
+        return str(a)
+    except ValueError:
+        die("Not a valid IP address.")
+
+
+# ---------------- AdGuard ----------------
+def ag(path, body=None):
+    c = env("adguard")
+    if not c.get("URL"): die("AdGuard is not connected yet. Add it in the AI Control Panel -> Settings.")
+    req = urllib.request.Request(c["URL"].rstrip("/") + path, data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Content-Type": "application/json"}, method="POST" if body is not None else "GET")
+    tok = base64.b64encode(f"{c.get('USER','')}:{c.get('PASS','')}".encode()).decode()
+    req.add_header("Authorization", "Basic " + tok)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        t = r.read().decode() or "{}"
+    try: return json.loads(t)
+    except Exception: return {"raw": t}
+
+
+def adguard(sub, args):
+    if sub == "stats":
+        s = ag("/control/stats")
+        keep = {k: s.get(k) for k in ("num_dns_queries", "num_blocked_filtering", "avg_processing_time")}
+        keep["top_blocked"] = s.get("top_blocked_domains", [])[:10]
+        keep["top_clients"] = s.get("top_clients", [])[:10]
+        print(json.dumps(keep, indent=1))
+    elif sub == "top":
+        s = ag("/control/stats"); print(json.dumps({"top_queried": s.get("top_queried_domains", [])[:15]}, indent=1))
+    elif sub == "clients":
+        print(json.dumps(ag("/control/clients"), indent=1)[:6000])
+    elif sub == "status":
+        print(json.dumps(ag("/control/status"), indent=1))
+    elif sub == "log":
+        client = check_ip(args[0]) if args else None
+        n = min(int(args[1]) if len(args) > 1 else 50, 300)
+        q = f"/control/querylog?limit={n}" + (f"&search={client}" if client else "")
+        rows = ag(q).get("data", [])
+        for r in rows:
+            print(r.get("time", "")[:19], r.get("client", ""), r.get("question", {}).get("name", ""), r.get("reason", ""))
+    else:
+        die("adguard: stats|top|clients|status|log")
+
+
+# ---------------- Router (drivers in routers.py) ----------------
+ROUTER_SUBS = ("clients", "dhcp", "firewall", "status", "updates", "wifi")
+
+
+def router_driver():
+    """The configured router driver. Generic can block through AdGuard only when AdGuard is connected."""
+    return R.get(R.load_conf(), adguard=(lambda **k: "") if env("adguard").get("URL") else None)
+
+
+def router(sub):
+    if sub not in ROUTER_SUBS + ("caps", "test", "detect"): die("router: " + "|".join(ROUTER_SUBS + ("caps", "test", "detect")))
+    try:
+        d = router_driver()
+        if sub == "caps":
+            print(json.dumps({"type": d.NAME, "label": d.LABEL, "can": sorted(d.caps()), "tested_on_real_hardware": d.TESTED}, indent=1)); return
+        if sub == "test": print(json.dumps(d.test(), indent=1)); return
+        if sub == "detect": print(json.dumps(R.detect(d.c.get("HOST") or None), indent=1)); return
+        if isinstance(d, R.OpenWrt): print(d.raw(sub)); return          # same commands and raw output as always
+        if sub in ("clients", "dhcp"):
+            rows = d.clients()
+            print("\n".join(f"{c['ip']:15} {c['mac']}  {'online ' if c['online'] else 'offline'}  {c['name']}" for c in rows) or "No devices found.")
+        elif sub == "status": print(json.dumps(d.status(), indent=1))
+        else: die(f"'router {sub}' is not available for {d.LABEL}. This router type can: {', '.join(sorted(d.caps()))}.")
+    except R.RouterError as e:
+        die(f"Router: {e}")
+
+
+# ---------------- Requests (approval queue) ----------------
+def validate(action, params):
+    """Checks a change request. Used when it is created AND again right before it runs."""
+    if action not in ACTIONS: die("Unknown action. Allowed: " + ", ".join(ACTIONS))
+    if not isinstance(params, dict): die("Params must be a JSON object")
+    for k in ACTIONS[action]:
+        if not isinstance(params.get(k), str): die(f"Missing parameter: {k}")
+    if "domain" in params and not RE_DOMAIN.match(params["domain"]): die("Invalid domain")
+    if "mac" in params and not RE_MAC.match(params["mac"]): die("Invalid MAC address")
+    if "client" in params:
+        try: ipaddress.ip_address(params["client"])
+        except ValueError:
+            if not RE_NAME.match(params["client"]): die("Client must be an IP or a simple name")
+    if "name" in params: params["name"] = re.sub(r"[^A-Za-z0-9 ._-]", "", str(params["name"]))[:40]
+    return {k: params[k] for k in ACTIONS[action] + ["name"] if k in params}
+
+
+def request(action, params_json, reason):
+    try: params = json.loads(params_json)
+    except Exception: die("Params must be JSON, e.g. '{\"domain\":\"example.com\"}'")
+    params = validate(action, params)
+    via = ""
+    if action.startswith("router_"):
+        try: d = router_driver()
+        except R.RouterError as e: die(f"Router: {e}")
+        if "block" not in d.caps():
+            die(f"{d.LABEL} can't block devices from here. Ask for adguard_block_client with the device's IP instead.")
+        via = "AdGuard DNS block, by IP" if d.NAME == "generic" else d.LABEL
+    os.makedirs(REQ, exist_ok=True)
+    rid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+    rec = {"id": rid, "created": time.strftime("%Y-%m-%d %H:%M:%S"), "by": re.sub(r"[^\w.-]", "", os.environ.get("SUDO_USER") or "root")[:32], "action": action,
+           "params": params, "reason": reason[:500], "status": "pending", **({"via": via} if via else {})}
+    p = f"{REQ}/{rid}.json"
+    json.dump(rec, open(p, "w"), indent=1)
+    subprocess.run(["chown", f"{OWNER}:{OWNER}", p])
+    notify(f"🛡️ Approval needed\n{describe(rec)}\nReason: {reason[:300]}\n\nTap a button, or use the AI Control Panel -> Approvals.",
+           buttons=[[{"text": "✅ Approve", "callback_data": f"ok:{rid}"}, {"text": "❌ Reject", "callback_data": f"no:{rid}"}]])
+    print(f"Request {rid} created. It will run only after the owner approves it in the AI Control Panel.")
+
+
+def list_requests():
+    rows = []
+    for f in sorted(os.listdir(REQ) if os.path.isdir(REQ) else [])[-30:]:
+        r = jload(f"{REQ}/{f}", None)
+        if r: rows.append(f"{r['id']}  {r['status']:9}  {describe(r)}  {r.get('result','')[:80]}")
+    print("\n".join(rows) or "No requests.")
+
+
+def describe(r):
+    p = r["params"]
+    return {"adguard_block_domain": f"Block website {p.get('domain')} for the whole network (AdGuard)",
+            "adguard_unblock_domain": f"Unblock website {p.get('domain')} (AdGuard)",
+            "adguard_block_client": f"Stop DNS for device {p.get('client')} (AdGuard)",
+            "adguard_unblock_client": f"Allow DNS again for device {p.get('client')} (AdGuard)",
+            "router_block_mac": f"Block device {p.get('mac')} {p.get('name','')} from the internet ({r.get('via') or 'router'})",
+            "router_unblock_mac": f"Unblock device {p.get('mac')} ({r.get('via') or 'router'})"}.get(r["action"], r["action"])
+
+
+def tg(method, body, timeout=15):
+    c = env("telegram")
+    if not c.get("TOKEN"): return None
+    req = urllib.request.Request(f"https://api.telegram.org/bot{c['TOKEN']}/{method}", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def notify(text, buttons=None):
+    c = env("telegram")
+    if not (c.get("TOKEN") and c.get("CHAT_ID")): return
+    body = {"chat_id": c["CHAT_ID"], "text": text[:4000]}
+    if buttons: body["reply_markup"] = {"inline_keyboard": buttons}
+    try: tg("sendMessage", body)
+    except Exception: pass
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help", "help"): print(__doc__); return
+    cmd = a[0]
+    if cmd == "devices":
+        inv = jload(f"{BASE}/inventory.json", {})
+        for d in sorted(inv.values(), key=lambda d: tuple(int(x) for x in d.get("ip", "0.0.0.0").split("."))):
+            print(f"{d.get('ip',''):15} {d.get('mac',''):17} {('KNOWN ' + d.get('label','')) if d.get('known') else 'UNKNOWN':24} "
+                  f"{d.get('vendor','')[:28]:28} last seen {d.get('last_seen','')}")
+    elif cmd == "scan":
+        print(run([os.path.join(HERE, "net-scan")], 300))
+    elif cmd == "ports" and len(a) > 1:
+        ip = check_ip(a[1])
+        print(run(["nmap", "-Pn", "-sV", "--version-light", "--top-ports", "200", "-T4", ip], 600))
+    elif cmd == "alerts":
+        n = int(a[1]) if len(a) > 1 else 20
+        try: print("".join(open(f"{BASE}/alerts.log").readlines()[-n:]) or "No alerts.")
+        except FileNotFoundError: print("No alerts.")
+    elif cmd == "adguard": adguard(a[1] if len(a) > 1 else "", a[2:])
+    elif cmd == "router": router(a[1] if len(a) > 1 else "")
+    elif cmd == "requests": list_requests()
+    elif cmd == "request" and len(a) > 3: request(a[1], a[2], a[3])
+    else: print(__doc__)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except urllib.error.HTTPError as e:
+        die(f"The device answered with an error: HTTP {e.code} {e.reason} (check the address / login in the AI Control Panel -> Settings)")
+    except (urllib.error.URLError, OSError) as e:
+        die(f"Could not reach it: {getattr(e, 'reason', e)}")

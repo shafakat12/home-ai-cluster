@@ -23,7 +23,7 @@ if ! [[ "${SERVER_IP:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || ! [[ "${LAN_C
   echo "(cp config.example.env config.env), then run  sudo bash install.sh  again."; exit 1
 fi
 
-STEPS=(10-base 15-storage 20-llama 30-services 40-models 50-router 60-control-panel 70-web-search 80-health 90-finish)
+STEPS=(10-base 15-storage 20-llama 30-services 40-models 45-network 50-router 60-control-panel 70-web-search 80-health 85-comfyui 90-finish)
 if [ $# -gt 0 ]; then STEPS=("$@"); fi
 
 banner "Home AI Cluster installer  ($(date))"

@@ -1,0 +1,130 @@
+#!/usr/bin/python3 -I
+"""Scans the home network, keeps a device inventory, alerts on NEW devices and risky open ports.
+Runs as root from a systemd timer. Usage: net-scan [--ports]  (--ports = weekly port audit too)"""
+import json, os, re, sys, time, subprocess, ipaddress, urllib.request
+
+BASE = "/var/lib/home-ai/net"            # root-owned all the way up, so only root can change what root reads
+INV = f"{BASE}/inventory.json"
+LABELS = f"{BASE}/labels.json"          # written by the AI Control Panel (owner marks devices as known)
+PORTS = f"{BASE}/ports.json"
+ALERTS = f"{BASE}/alerts.log"
+RISKY = {21: "FTP (unencrypted)", 23: "Telnet (unencrypted)", 135: "Windows RPC", 139: "NetBIOS", 445: "Windows file sharing (SMB)",
+         1900: "UPnP", 3389: "Remote Desktop", 5900: "VNC remote screen", 5555: "Android debug (ADB)", 2375: "Docker API (no auth)",
+         6379: "Redis (no auth)", 27017: "MongoDB", 9100: "Printer raw port", 8291: "MikroTik admin", 7547: "TR-069 remote management"}
+
+
+def conf(key):
+    try:
+        with open("/opt/ai/ai.conf") as f:
+            for l in f:
+                if l.startswith(key + "="): return l.strip().split("=", 1)[1]
+    except OSError: pass
+    return ""
+
+
+def now(): return time.strftime("%Y-%m-%d %H:%M:%S")
+def jload(p, d):
+    try: return json.load(open(p))
+    except Exception: return d
+
+
+def subnet():
+    out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"], capture_output=True, text=True).stdout
+    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+/\d+)", out)
+    return str(ipaddress.ip_interface(m.group(1)).network) if m else conf("LAN_CIDR")
+
+
+def alert(kind, text):
+    line = json.dumps({"time": now(), "kind": kind, "text": text})
+    open(ALERTS, "a").write(line + "\n")
+    notify(("🚨 " if kind != "info" else "ℹ️ ") + text)
+
+
+def notify(text):
+    c = {}
+    try:
+        for l in open("/opt/ai/secrets/telegram.env"):
+            if "=" in l: k, v = l.strip().split("=", 1); c[k] = v.strip('"')
+    except FileNotFoundError: return
+    if not (c.get("TOKEN") and c.get("CHAT_ID")): return
+    try:
+        urllib.request.urlopen(urllib.request.Request(f"https://api.telegram.org/bot{c['TOKEN']}/sendMessage",
+            data=json.dumps({"chat_id": c["CHAT_ID"], "text": text}).encode(), headers={"Content-Type": "application/json"}), timeout=15)
+    except Exception: pass
+
+
+def discover(net):
+    found = {}
+    # ARP scan finds phones/IoT that ignore pings
+    r = subprocess.run(["arp-scan", "--localnet", "--plain", "--retry=2"], capture_output=True, text=True, timeout=120)
+    for line in r.stdout.splitlines():
+        p = line.split("\t")
+        if len(p) >= 2 and re.match(r"^\d+\.\d+\.\d+\.\d+$", p[0]):
+            found[p[1].lower()] = {"ip": p[0], "mac": p[1].lower(), "vendor": p[2] if len(p) > 2 else ""}
+    # nmap ping sweep adds hostnames
+    r = subprocess.run(["nmap", "-sn", "-R", net], capture_output=True, text=True, timeout=240)
+    ip = name = None
+    for line in r.stdout.splitlines():
+        m = re.match(r"Nmap scan report for (?:(.+) \()?(\d+\.\d+\.\d+\.\d+)\)?", line)
+        if m: name, ip = m.group(1), m.group(2); continue
+        m = re.match(r"MAC Address: ([0-9A-F:]{17}) ?\(?([^)]*)\)?", line)
+        if m and ip:
+            mac = m.group(1).lower()
+            d = found.setdefault(mac, {"ip": ip, "mac": mac, "vendor": m.group(2)})
+            if name: d["name"] = name
+            ip = name = None
+    return found
+
+
+def port_audit(inv):
+    ports = jload(PORTS, {})
+    for d in inv.values():
+        if d.get("last_seen", "")[:10] != now()[:10]: continue
+        ip = d["ip"]
+        r = subprocess.run(["nmap", "-Pn", "-T4", "--top-ports", "300", "--open", "-sV", "--version-light", ip],
+                           capture_output=True, text=True, timeout=600).stdout
+        opn = [l.strip() for l in r.splitlines() if re.match(r"^\d+/(tcp|udp)\s+open", l)]
+        risky = [f"{int(l.split('/')[0])} {RISKY[int(l.split('/')[0])]}" for l in opn if int(l.split('/')[0]) in RISKY]
+        prev = set(ports.get(ip, {}).get("risky", []))
+        ports[ip] = {"scanned": now(), "open": opn, "risky": risky, "label": d.get("label") or d.get("name") or d.get("vendor", "")}
+        new_risky = [x for x in risky if x not in prev]
+        if new_risky:
+            alert("risk", f"Risky service open on {ip} ({ports[ip]['label']}): {', '.join(new_risky)}")
+    json.dump(ports, open(PORTS, "w"), indent=1)
+
+
+def main():
+    os.makedirs(BASE, exist_ok=True)
+    inv, labels = jload(INV, {}), jload(LABELS, {})
+    first_run = not inv
+    found = discover(subnet())
+    for mac, d in found.items():
+        cur = inv.get(mac)
+        if not cur:
+            cur = {"mac": mac, "first_seen": now()}
+            known = labels.get(mac, {}).get("known") or first_run
+            if not known:
+                alert("new_device", f"NEW device joined the network: {d['ip']}  {mac}  {d.get('vendor','')}  {d.get('name','')}. "
+                                    f"If you don't recognise it, block it in the control panel (Network tab); you approve it there or here.")
+        cur.update({k: v for k, v in d.items() if v})
+        cur["last_seen"] = now()
+        inv[mac] = cur
+    for mac, lab in labels.items():
+        if mac in inv:
+            inv[mac]["known"] = bool(lab.get("known")); inv[mac]["label"] = lab.get("label", "")
+    if first_run:   # everything present at the very first scan is treated as yours
+        for d in inv.values():
+            d.setdefault("known", True)
+        json.dump({m: {"known": True, "label": d.get("name") or d.get("vendor", "")} for m, d in inv.items()} | labels,
+                  open(LABELS, "w"), indent=1)
+        subprocess.run(["chown", f"{conf('ADMIN') or 'root'}:", LABELS])   # the control panel (admin user) edits the labels
+        alert("info", f"Network watch started: {len(inv)} devices found and marked as yours. New ones will be reported.")
+    json.dump(inv, open(INV, "w"), indent=1)
+    os.chmod(INV, 0o644)
+    if "--ports" in sys.argv:
+        port_audit(inv)
+    print(f"{len(found)} devices online, {len(inv)} known in total.")
+
+
+if __name__ == "__main__":
+    main()

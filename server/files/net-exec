@@ -1,0 +1,115 @@
+#!/usr/bin/python3 -I
+"""Runs network changes ONLY after the owner approved them - in the AI Control Panel, or by tapping
+Approve in the Telegram alert (only taps from the owner's own Telegram account count). Runs as root (systemd)."""
+import json, os, time, subprocess, importlib.machinery, importlib.util
+
+loader = importlib.machinery.SourceFileLoader("netctl", os.path.join(os.path.dirname(os.path.realpath(__file__)), "netctl"))
+spec = importlib.util.spec_from_loader("netctl", loader); N = importlib.util.module_from_spec(spec); loader.exec_module(N)
+REQ = N.REQ
+OFFSET_FILE = f"{N.BASE}/.tg-offset"
+
+
+def adguard_rules(add=None, remove=None):
+    rules = N.ag("/control/filtering/status").get("user_rules", []) or []
+    if add and add not in rules: rules.append(add)
+    if remove: rules = [r for r in rules if r != remove]
+    N.ag("/control/filtering/set_rules", {"rules": rules})
+    return f"done - AdGuard custom rules now: {len(rules)}"
+
+
+def adguard_access(block=None, unblock=None):
+    acc = N.ag("/control/access/list")
+    dis = acc.get("disallowed_clients", []) or []
+    if block and block not in dis: dis.append(block)
+    if unblock: dis = [c for c in dis if c != unblock]
+    acc["disallowed_clients"] = dis
+    N.ag("/control/access/set", {k: acc.get(k, []) or [] for k in ("allowed_clients", "disallowed_clients", "blocked_hosts")})
+    return f"done - AdGuard blocked devices: {', '.join(dis) or 'none'}"
+
+
+def router_driver():
+    """The configured router driver (routers.py). Generic blocks through AdGuard when AdGuard is connected."""
+    return N.R.get(N.R.load_conf(), adguard=adguard_access if N.env("adguard").get("URL") else None)
+
+
+def execute(r):
+    a = r["action"]
+    try:
+        p = N.validate(a, r["params"])          # check again right before running
+    except SystemExit:
+        raise RuntimeError("request failed the safety check")
+    if a == "adguard_block_domain":   return adguard_rules(add=f"||{p['domain']}^")
+    if a == "adguard_unblock_domain": return adguard_rules(remove=f"||{p['domain']}^")
+    if a == "adguard_block_client":   return adguard_access(block=p["client"])
+    if a == "adguard_unblock_client": return adguard_access(unblock=p["client"])
+    if a in ("router_block_mac", "router_unblock_mac"):
+        d = router_driver()                     # MAC checked again inside the driver (aa:bb:cc:dd:ee:ff only)
+        try: return d.block_mac(p["mac"]) if a == "router_block_mac" else d.unblock_mac(p["mac"])
+        except N.R.RouterError as e: raise RuntimeError(str(e))
+    raise RuntimeError("unknown action")
+
+
+def save(path, r):
+    json.dump(r, open(path, "w"), indent=1)
+    subprocess.run(["chown", f"{N.OWNER}:{N.OWNER}", path])
+
+
+def run_approved():
+    for f in sorted(os.listdir(REQ)) if os.path.isdir(REQ) else []:
+        path = f"{REQ}/{f}"
+        if os.path.islink(path) or not f.endswith(".json"): continue
+        try: r = json.load(open(path))
+        except Exception: continue
+        if r.get("status") != "approved": continue
+        r["status"] = "running"; save(path, r)
+        try:
+            r["result"] = str(execute(r))[:1000]; r["status"] = "done"
+        except Exception as e:
+            r["result"] = f"error: {e}"; r["status"] = "failed"
+        r["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        save(path, r)
+        N.notify(f"{'✅ Done' if r['status']=='done' else '❌ Failed'}: {N.describe(r)}\n{r['result'][:300]}")
+
+
+def telegram_buttons(wait):
+    """Approve/Reject taps on the alert messages. Returns quickly when Telegram isn't set up."""
+    c = N.env("telegram")
+    if not (c.get("TOKEN") and c.get("CHAT_ID")):
+        time.sleep(wait); return
+    try: off = int(open(OFFSET_FILE).read())
+    except Exception: off = 0
+    try:
+        res = N.tg("getUpdates", {"offset": off, "timeout": wait, "allowed_updates": ["callback_query"]}, timeout=wait + 15)
+    except Exception:
+        time.sleep(wait); return
+    for u in (res or {}).get("result", []):
+        off = u["update_id"] + 1
+        q = u.get("callback_query")
+        if not q: continue
+        ok, msg = False, "Not allowed."
+        if str(q.get("from", {}).get("id")) == str(c["CHAT_ID"]):      # only the owner's own account
+            kind, _, rid = (q.get("data") or "").partition(":")
+            path = f"{REQ}/{rid}.json"
+            if kind in ("ok", "no") and rid.replace("-", "").isalnum() and os.path.isfile(path) and not os.path.islink(path):
+                r = json.load(open(path))
+                if r.get("status") == "pending":
+                    r["status"] = "approved" if kind == "ok" else "rejected"
+                    r["decided"] = time.strftime("%Y-%m-%d %H:%M:%S"); r["decided_via"] = "telegram"
+                    save(path, r); ok = True
+                    msg = "Approved - running now." if kind == "ok" else "Rejected."
+                else:
+                    msg = f"Already {r.get('status')}."
+        try:
+            N.tg("answerCallbackQuery", {"callback_query_id": q["id"], "text": msg})
+            if ok and q.get("message"):
+                N.tg("editMessageText", {"chat_id": q["message"]["chat"]["id"], "message_id": q["message"]["message_id"],
+                                         "text": q["message"].get("text", "") + f"\n\n➡️ {msg}"})
+        except Exception:
+            pass
+    open(OFFSET_FILE, "w").write(str(off))
+
+
+if __name__ == "__main__":
+    while True:
+        run_approved()
+        telegram_buttons(10)

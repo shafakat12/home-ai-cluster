@@ -1,0 +1,125 @@
+#!/usr/bin/python3 -I
+"""router-admin - the control panel's only way to the router settings. Runs as root through one sudo rule
+(/etc/sudoers.d/home-ai-router lists exactly these five commands).
+
+  router-admin show         the saved settings WITHOUT secrets, plus the list of router types (JSON)
+  router-admin save         new settings as JSON on stdin; an empty secret keeps the saved one (JSON result)
+  router-admin test         read-only connection test with the saved settings (JSON)
+  router-admin detect       look at the router's banners and suggest a type; optional {"host": ...} on stdin (JSON)
+  router-admin forget-pin   trust the router's new HTTPS certificate on the next connection (JSON)
+
+Rules: the router must be on the home network (private IPv4 or a .lan/.local name) on the fixed ports of its type;
+every value is checked against a strict pattern; nothing is ever passed to a shell. It writes only
+/var/lib/home-ai/net/router.env and /var/lib/home-ai/net/router-pins.json, atomically, mode 600.
+"""
+import importlib.machinery, importlib.util, json, os, re, sys
+
+_ld = importlib.machinery.SourceFileLoader("routers", os.path.join(os.path.dirname(os.path.realpath(__file__)), "routers.py"))
+_sp = importlib.util.spec_from_loader("routers", _ld); R = importlib.util.module_from_spec(_sp); _ld.exec_module(R)
+
+RE_PASS = re.compile(r"^[\x21-\x7e](?:[\x20-\x7e]{0,126}[\x21-\x7e])?$")     # printable, no leading/trailing space
+ADGUARD_ENV = "/opt/ai/secrets/adguard.env"
+
+
+def out(obj, code=0):
+    print(json.dumps(obj)); sys.exit(code)
+
+
+def stdin_json():
+    data = sys.stdin.read(20001)
+    if len(data) > 20000: out({"ok": False, "error": "input too large"}, 2)
+    try: d = json.loads(data or "{}")
+    except ValueError: out({"ok": False, "error": "input is not JSON"}, 2)
+    if not isinstance(d, dict): out({"ok": False, "error": "input must be a JSON object"}, 2)
+    return d
+
+
+def check_value(key, v):
+    """One setting, strictly checked. Returns the clean value."""
+    v = str(v).strip()
+    if key == "HOST": return R.check_host(v)
+    if key == "USER":
+        if not R.RE_USER.match(v): raise R.RouterError("user name: letters, numbers and . _ @ - only")
+        return v
+    if key == "SITE":
+        if not R.RE_SITE.match(v): raise R.RouterError("site name: letters, numbers, spaces and . _ - only")
+        return v
+    if key == "PASS":
+        if not RE_PASS.match(v) or '"' in v: raise R.RouterError("password: printable characters only, no double quote")
+        return v
+    if key in R.SECRET_KEYS:
+        if not R.RE_TOKEN.match(v): raise R.RouterError(f"{R.FIELD_INFO[key][0]}: unexpected characters")
+        return v
+    raise R.RouterError(f"unknown setting {key}")
+
+
+def save(d):
+    brand = str(d.get("brand", ""))
+    if brand not in R.DRIVERS: raise R.RouterError("unknown router type")
+    cls = R.DRIVERS[brand]
+    old = R.load_conf()
+    new = {"BRAND": brand}
+    for key in cls.FIELDS:
+        if key == "PORT":
+            p = str(d.get("port") or cls.PORTS[0])
+            if not p.isdigit() or int(p) not in cls.PORTS: raise R.RouterError(f"port must be one of {', '.join(map(str, cls.PORTS))}")
+            new["PORT"] = p; continue
+        v = d.get(key.lower(), "")
+        if v in ("", None):
+            if key in R.SECRET_KEYS and old.get("BRAND") == brand and old.get(key): new[key] = old[key]   # keep the saved secret
+            elif key in ("HOST",) and brand != "generic": raise R.RouterError("router address missing")
+            continue
+        new[key] = check_value(key, v)
+    if old.get("HOST") and (old.get("HOST") != new.get("HOST") or old.get("BRAND") != brand):
+        try: R.forget_pin(R.resolve_home(old["HOST"]))          # new router or type: its certificate is learned again
+        except R.RouterError: pass
+    R._write600(R.ENV_FILE, "# router settings for the network watch (written by router-admin)\n"
+                + "".join(f"{k}={v}\n" for k, v in new.items()))
+    return {"ok": True, "brand": brand, "output": f"Saved. Router type: {cls.LABEL}."}
+
+
+def show():
+    c = R.load_conf()
+    legacy = not os.path.exists(R.ENV_FILE) and c.get("BRAND") == "openwrt"
+    return {"ok": True, "brand": c.get("BRAND", "generic"), "host": c.get("HOST", ""), "port": c.get("PORT", ""),
+            "user": c.get("USER", ""), "site": c.get("SITE", ""), "legacy_file": legacy,
+            "saved": {k: bool(c.get(k)) for k in sorted(R.SECRET_KEYS)}, "gateway": R.gateway(), "catalog": R.catalog()}
+
+
+def main():
+    if os.geteuid() != 0: out({"ok": False, "error": "router-admin must run as root (through its sudo rule)"}, 2)
+    a = sys.argv[1:]
+    if len(a) != 1 or a[0] not in ("show", "save", "test", "detect", "forget-pin", "reserve"):
+        out({"ok": False, "error": "usage: router-admin show|save|test|detect|forget-pin|reserve"}, 2)
+    try:
+        if a[0] == "show": out(show())
+        if a[0] == "save": out(save(stdin_json()))
+        if a[0] == "test":
+            ag = {}
+            try:
+                with open(ADGUARD_ENV) as f: ag = dict(l.strip().split("=", 1) for l in f if "=" in l)
+            except OSError: pass
+            out(R.get(R.load_conf(), adguard=(lambda **k: "") if ag.get("URL") else None).test())
+        if a[0] == "detect":
+            d = stdin_json(); host = d.get("host") or R.load_conf().get("HOST") or None
+            out({"ok": True, **R.detect(R.check_host(host) if host else None)})
+        if a[0] == "forget-pin":
+            host = R.load_conf().get("HOST") or R.gateway()
+            n = R.forget_pin(R.resolve_home(host)) if host else 0
+            out({"ok": True, "output": f"The router's certificate will be learned again on the next connection ({n} removed)."})
+        if a[0] == "reserve":
+            d = stdin_json()
+            drv = R.get(R.load_conf())
+            if "reserve" not in drv.caps():
+                out({"ok": False, "error": f"{drv.LABEL} can't set a DHCP reservation from here. Do it in the router's own settings."}, 1)
+            try:
+                mac = R.norm_mac(str(d.get("mac", ""))); ip = R.home_ip(str(d.get("ip", "")))   # validated + shell-safe
+            except R.RouterError as e:
+                out({"ok": False, "error": str(e)}, 1)
+            out({"ok": True, "output": drv.reserve_dhcp(mac, ip, str(d.get("name", "")))})
+    except R.RouterError as e:
+        out({"ok": False, "error": str(e)}, 1)
+
+
+if __name__ == "__main__":
+    main()
