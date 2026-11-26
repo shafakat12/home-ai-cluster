@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
-# Nightly backup of the Home AI settings and chat data (not the big model files). Keeps the last 7 days.
+# Nightly backup of the Home AI settings and chat data (not the big model files). Keeps the last 7 days. Runs as root.
+# The backup folder's parent can belong to the admin user (e.g. /opt/ai), so root only writes into a root-owned backup
+# folder, and only from inside it (cd first, then relative paths): swapping the folder or a link can't redirect writes.
 set -uo pipefail
 B=$(grep -oP '^BACKUP_DIR=\K.*' /opt/ai/ai.conf 2>/dev/null); B=${B:-/opt/ai/backups}
-mkdir -p "$B"; chmod 700 "$B"
-D=$B/$(date +%F); mkdir -p "$D"
+[ -e "$B" ] || [ -L "$B" ] || install -d -m 700 -o root -g root "$B"
+if [ -L "$B" ] || [ ! -d "$B" ] || [ "$(stat -c %u "$B")" != 0 ]; then echo "FAILED: $B is not a root-owned folder - no backup"; exit 1; fi
+cd "$B" || exit 1
+[ "$(stat -c %u .)" = 0 ] || { echo "FAILED: the backup folder changed - no backup"; exit 1; }
+chmod 700 .
+DAY=$(date +%F); [ -d "./$DAY" ] || mkdir -m 700 "./$DAY"
 V=$(docker volume inspect open-webui -f '{{.Mountpoint}}' 2>/dev/null)
 if [ -n "$V" ] && [ -f "$V/webui.db" ]; then
-  sqlite3 "$V/webui.db" ".backup '$D/open-webui-webui.db'"
-  tar -C "$V" --exclude=webui.db -czf "$D/open-webui-files.tgz" . 2>/dev/null
+  sqlite3 "$V/webui.db" ".backup './$DAY/open-webui-webui.db'"
+  tar -C "$V" --exclude=webui.db -czf - . 2>/dev/null > "./$DAY/open-webui-files.tgz"
 fi
-tar -C /opt/ai -czf "$D/ai-settings.tgz" --ignore-failed-read secrets llama-swap.yaml router.json gpu-policy.json ai.conf \
-    searxng suggestions.json api-allow.txt panel-allow.txt workers.txt 2>/dev/null
-chmod -R go-rwx "$D"
-ls -1d "$B"/20* 2>/dev/null | head -n -7 | xargs -r rm -rf
-echo "backup $(du -sh "$D" | cut -f1) -> $D"
+tar -C /opt/ai -czf - --ignore-failed-read secrets llama-swap.yaml router.json gpu-policy.json ai.conf \
+    searxng suggestions.json api-allow.txt panel-allow.txt workers.txt 2>/dev/null > "./$DAY/ai-settings.tgz"
+# root-only state (network watch data, router settings and pinned certificates) and the root helpers
+tar -C / -czf - --ignore-failed-read var/lib/home-ai usr/local/lib/home-ai 2>/dev/null > "./$DAY/root-state.tgz"
+chmod -R go-rwx "./$DAY"
+find . -maxdepth 1 -mindepth 1 -type d -name '20??-??-??' | sort | head -n -7 | xargs -r rm -rf --
+echo "backup $(du -sh "./$DAY" | cut -f1) -> $B/$DAY"

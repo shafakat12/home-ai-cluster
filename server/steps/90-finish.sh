@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Summary: addresses, setup code, what to do next.
 source "$REPO/server/lib.sh"; set -uo pipefail
+# older versions kept root helpers in /opt/ai/sbin (inside the admin user's /opt/ai): remove it once nothing uses it
+if [ -d /opt/ai/sbin ] && ! grep -rqs /opt/ai/sbin /etc/systemd/system /etc/sudoers.d; then rm -rf /opt/ai/sbin; info "removed the old /opt/ai/sbin"; fi
 systemctl is-active llama-swap open-webui ai-control-panel ai-worker-kit 2>/dev/null | paste -sd' ' - | sed 's/^/  services: /'
 CODE=$(cat /opt/ai/secrets/setup-code 2>/dev/null)
 cat <<EOF
